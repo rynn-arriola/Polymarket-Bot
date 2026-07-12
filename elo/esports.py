@@ -1,0 +1,569 @@
+"""Esports Elo adapter: Dota 2, CS2, League of Legends, Valorant.
+
+Sources (all free, all verified live 2026-07-08 — none of them need the
+Riot developer portal or a STRATZ key, which cover ranked/player data
+rather than pro match results):
+
+- DOTA2    — OpenDota /proMatches (keyless; ~100 matches/call, paginated
+             back through history via less_than_match_id).
+- CS2      — bo3.gg public API (keyless; real dates, team names via
+             with=teams, tier labels; 70k+ finished matches available).
+- LOL      — Leaguepedia (lol.fandom.com) Cargo API (keyless; the standard
+             community source for pro LoL results; date-windowed queries).
+- VALORANT — vlr.gg via the vlr.orlandomm.net mirror (keyless but FLAKY —
+             scrape-backed, intermittent failures, only relative dates
+             like "2w 2d", ~50 results/page reverse-chronological).
+
+Because several of these only expose a sliding window of recent results,
+each title keeps an ACCUMULATING local store (data/cache/esports_*.json,
+matches keyed by source match id, merged on every build). History deepens
+the longer the bot runs; a fresh install starts with whatever the source
+exposes today and grows from there. Run build_ratings.py daily.
+
+Model notes: match-level (series winner, not per-map), no home advantage
+(LAN/online is not knowable cheaply), no margin-of-victory in v1, and a
+higher K than traditional sports — esports rosters and game metas shift
+fast, so recent results should dominate. Player-roster changes are the
+big blind spot (an Elo follows the TEAM NAME, and a rebuilt roster keeps
+the old tag's rating) — that argues for high K, thresholds derived from
+the measured noise floor, and humility about this whole category.
+"""
+
+import json
+import logging
+import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+import config
+from elo import history, params
+from elo.engine import EloEngine
+
+log = logging.getLogger("divergence_bot.elo.esports")
+
+TITLES = ("dota2", "cs2", "lol", "valorant")
+
+STORE_DIR = history.CACHE_DIR
+
+
+# ------------------------------------------------------------------
+# Accumulating store: {match_id: [iso_date, winner, loser]}
+# ------------------------------------------------------------------
+
+def _store_path(title: str) -> Path:
+    return STORE_DIR / f"esports_{title}_store.json"
+
+
+def _load_store(title: str) -> dict:
+    try:
+        with open(_store_path(title), encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_store(title: str, store: dict):
+    STORE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_store_path(title), "w", encoding="utf-8") as f:
+        json.dump(store, f)
+
+
+# Sidecar team-name -> source-team-id map, accumulated as results are
+# ingested (dota proMatches, cs2/valorant result feeds all carry team ids).
+# Used by elo/rosters.py to resolve a team to its roster endpoint without a
+# separate name->id lookup. LoL is name-based and has no id map.
+
+def _teams_path(title: str) -> Path:
+    return STORE_DIR / f"esports_{title}_teams.json"
+
+
+def load_team_ids(title: str) -> dict:
+    try:
+        with open(_teams_path(title), encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_team_ids(title: str, teams: dict):
+    if not teams:
+        return
+    STORE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_teams_path(title), "w", encoding="utf-8") as f:
+        json.dump(teams, f)
+
+
+# ------------------------------------------------------------------
+# DOTA2 — OpenDota
+# ------------------------------------------------------------------
+
+OPENDOTA_URL = "https://api.opendota.com/api/proMatches"
+DOTA_BACKFILL_DAYS = 540   # ~18 months (was 365; the 150-call cap was the real
+                           # limiter, leaving only ~7 months — deeper history
+                           # gives each team more games to stabilize its rating)
+DOTA_MAX_CALLS = 450  # ~100 matches/call; free tier is 2000/day. On a deepening
+                       # run the walk re-scans the known head (adds nothing, the
+                       # added>0 early-stop guard keeps it going) then extends older.
+
+
+def _fetch_dota2(store: dict, teams: dict | None = None) -> int:
+    added, calls = 0, 0
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=DOTA_BACKFILL_DAYS)).timestamp()
+    less_than = None
+    consecutive_known = 0
+    while calls < DOTA_MAX_CALLS:
+        url = OPENDOTA_URL + (f"?less_than_match_id={less_than}" if less_than else "")
+        # A single timeout must not abort the whole year's walk (it did on
+        # 2026-07-08 — one read timeout left the store with 42 days of data).
+        data = None
+        for attempt in range(3):
+            data = history._get_json(url, timeout=40)
+            calls += 1
+            if data:
+                break
+            time.sleep(3 * (attempt + 1))
+        if not data:
+            log.warning("OpenDota walk aborted after repeated failures — "
+                        "store keeps whatever was fetched; rerun to deepen")
+            break
+        named_on_page, new_on_page = 0, 0
+        for m in data:
+            mid = str(m.get("match_id"))
+            ts = m.get("start_time") or 0
+            r_name, d_name = m.get("radiant_name"), m.get("dire_name")
+            if not (mid and r_name and d_name) or ts < cutoff_ts:
+                continue  # OpenDota rows without team names are common — not a stop signal
+            named_on_page += 1
+            if teams is not None:
+                if m.get("radiant_team_id"):
+                    teams[r_name] = m["radiant_team_id"]
+                if m.get("dire_team_id"):
+                    teams[d_name] = m["dire_team_id"]
+            if mid not in store:
+                new_on_page += 1
+                winner, loser = (r_name, d_name) if m.get("radiant_win") else (d_name, r_name)
+                store[mid] = [datetime.fromtimestamp(ts, timezone.utc).date().isoformat(),
+                              winner, loser]
+                added += 1
+        oldest_ts = min((m.get("start_time") or 0) for m in data)
+        less_than = min(m.get("match_id") for m in data)
+        if oldest_ts < cutoff_ts:
+            break
+        # Incremental early stop — only on pages that actually HAD named
+        # matches, all already stored, twice in a row. The first version
+        # stopped on any page with nothing new, which included pages that
+        # were 100% nameless rows — that silently truncated the backfill to
+        # ~3 months (caught 2026-07-08: store had no Team Spirit/BetBoom).
+        if named_on_page > 0 and new_on_page == 0:
+            consecutive_known += 1
+            if consecutive_known >= 2 and added > 0:
+                break
+        else:
+            consecutive_known = 0
+        time.sleep(1.1)  # keyless OpenDota allows 60 calls/min
+    return added
+
+
+# ------------------------------------------------------------------
+# CS2 — bo3.gg
+# ------------------------------------------------------------------
+
+BO3_URL = ("https://api.bo3.gg/api/v1/matches?filter%5Bmatches.status%5D%5Beq%5D=finished"
+           "&sort=-start_date&with=teams&page%5Blimit%5D=100&page%5Boffset%5D={offset}")
+CS2_BACKFILL_DAYS = 365
+CS2_MAX_CALLS = 200  # ~100 matches/call; a full year of tiers s-c runs ~15-18k matches
+CS2_TIERS = {"s", "a", "b", "c"}  # exclude tier d — semi-am noise that floods
+                                   # the rating pool with teams Polymarket never lists
+
+
+def _fetch_cs2(store: dict, teams: dict | None = None) -> int:
+    added, offset = 0, 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=CS2_BACKFILL_DAYS)).date().isoformat()
+    consecutive_known = 0
+    for _ in range(CS2_MAX_CALLS):
+        data = history._get_json(BO3_URL.format(offset=offset))
+        results = (data or {}).get("results") or []
+        if not results:
+            break
+        eligible_on_page, new_on_page = 0, 0
+        reached_cutoff = False
+        for m in results:
+            start = (m.get("start_date") or "")[:10]
+            if start and start < cutoff:
+                reached_cutoff = True
+                continue
+            if str(m.get("tier") or "").lower() not in CS2_TIERS:
+                continue  # filtered tiers are not a stop signal (a page can be 100% tier-d)
+            mid = str(m.get("id"))
+            t1, t2 = m.get("team1") or {}, m.get("team2") or {}
+            n1, n2 = t1.get("name"), t2.get("name")
+            wid = m.get("winner_team_id")
+            if not (mid and n1 and n2 and wid):
+                continue
+            eligible_on_page += 1
+            if teams is not None:
+                if t1.get("id"):
+                    teams[n1] = t1["id"]
+                if t2.get("id"):
+                    teams[n2] = t2["id"]
+            if mid not in store:
+                new_on_page += 1
+                winner, loser = (n1, n2) if wid == t1.get("id") else (n2, n1)
+                store[mid] = [start, winner, loser]
+                added += 1
+        if reached_cutoff:
+            break
+        if eligible_on_page > 0 and new_on_page == 0:
+            consecutive_known += 1
+            if consecutive_known >= 2 and added > 0:
+                break
+        else:
+            consecutive_known = 0
+        offset += 100
+        time.sleep(0.3)
+    return added
+
+
+# ------------------------------------------------------------------
+# LOL — Leaguepedia Cargo
+# ------------------------------------------------------------------
+
+LEAGUEPEDIA_URL = ("https://lol.fandom.com/api.php?action=cargoquery&format=json"
+                   "&tables=MatchSchedule&fields=Team1,Team2,Winner,DateTime_UTC"
+                   "&where={where}&limit=500&offset={offset}")
+LOL_BACKFILL_DAYS = 365
+
+
+def _lol_query(where: str, offset: int) -> list | None:
+    """One Cargo query with rate-limit awareness: Fandom returns rate-limit
+    errors as HTTP 200 with an {"error": ...} body (seen live 2026-07-08),
+    so a naive .get('cargoquery') reads as 'no rows' and silently truncates
+    the dataset. Detect it, back off, retry."""
+    for attempt in range(3):
+        data = history._get_json(LEAGUEPEDIA_URL.format(where=where, offset=offset))
+        if data is None:
+            return None
+        err = data.get("error")
+        if not err:
+            return data.get("cargoquery") or []
+        if "ratelimit" in str(err.get("code", "")).lower():
+            wait = 30 * (attempt + 1)
+            log.info(f"Leaguepedia rate-limited — waiting {wait}s")
+            time.sleep(wait)
+            continue
+        log.warning(f"Leaguepedia error: {err}")
+        return None
+    return None
+
+
+def _fetch_lol(store: dict, teams: dict | None = None) -> int:
+    # LoL is name-based (Leaguepedia uses team names, no numeric id) — the
+    # teams param is accepted for a uniform signature but not populated.
+    added = 0
+    start = date.today() - timedelta(days=LOL_BACKFILL_DAYS)
+    for c_start, c_end in history._month_chunks(start, date.today()):
+        offset = 0
+        while True:
+            where = urllib.parse.quote(
+                f"DateTime_UTC >= '{c_start} 00:00:00' AND DateTime_UTC <= '{c_end} 23:59:59' "
+                f"AND Winner IS NOT NULL AND Winner != ''"
+            )
+            rows = _lol_query(where, offset)
+            if not rows:
+                break
+            for r in rows:
+                t = r.get("title") or {}
+                t1, t2, winner_no = t.get("Team1"), t.get("Team2"), t.get("Winner")
+                dt = (t.get("DateTime UTC") or "")[:10]
+                if not (t1 and t2 and winner_no in ("1", "2") and dt):
+                    continue
+                mid = f"{dt}|{t1}|{t2}|{t.get('DateTime UTC')}"
+                if mid not in store:
+                    winner, loser = (t1, t2) if winner_no == "1" else (t2, t1)
+                    store[mid] = [dt, winner, loser]
+                    added += 1
+            if len(rows) < 500:
+                break
+            offset += 500
+            time.sleep(2.0)  # Fandom rate-limits anonymous clients aggressively
+        time.sleep(2.0)
+    return added
+
+
+# ------------------------------------------------------------------
+# VALORANT — vlr.gg mirror (flaky: retries, tolerate failures, only
+# relative dates — parsed to approximate ISO dates for ordering)
+# ------------------------------------------------------------------
+
+VLR_URL = "https://vlr.orlandomm.net/api/v1/results?page={page}"
+VLR_MAX_PAGES = 85  # the vlr.orlandomm mirror serves ~85 pages (~13 months);
+                     # page 90+ 404s. Was 40 (~5 months). A deepening run
+                     # re-scans the known head then extends older (added>0 guard).
+VLR_RETRIES = 3
+
+_AGO_UNITS = {"m": 1 / 1440, "h": 1 / 24, "d": 1, "w": 7, "mo": 30, "yr": 365}
+
+
+def _ago_to_date(ago: str) -> str:
+    """'2w 2d' -> approximate ISO date. Ordering-quality only."""
+    days = 0.0
+    for num, unit in re.findall(r"(\d+)\s*(mo|yr|[mhdw])", str(ago or "")):
+        days += int(num) * _AGO_UNITS.get(unit, 0)
+    return (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+
+
+def _fetch_valorant_vlr(store: dict, team_ids: dict | None = None) -> int:
+    added = 0
+    consecutive_known = 0
+    for page in range(1, VLR_MAX_PAGES + 1):
+        data = None
+        for attempt in range(VLR_RETRIES):
+            data = history._get_json(VLR_URL.format(page=page), timeout=25)
+            if data:
+                break
+            time.sleep(2 * (attempt + 1))
+        if not data:
+            log.warning(f"vlr.gg mirror: page {page} failed after {VLR_RETRIES} tries — continuing")
+            continue
+        page_added = 0
+        for m in data.get("data") or []:
+            mid = str(m.get("id"))
+            match_teams = m.get("teams") or []
+            if not mid or len(match_teams) != 2 or m.get("status") != "Completed":
+                continue
+            winner = next((t.get("name") for t in match_teams if t.get("won")), None)
+            loser = next((t.get("name") for t in match_teams if not t.get("won")), None)
+            if not (winner and loser):
+                continue
+            if team_ids is not None:
+                for t in match_teams:
+                    if t.get("name") and t.get("id"):
+                        team_ids[t["name"]] = t["id"]
+            if mid not in store:
+                store[mid] = [_ago_to_date(m.get("ago")), winner, loser]
+                added += 1
+                page_added += 1
+        consecutive_known = consecutive_known + 1 if page_added == 0 else 0
+        if consecutive_known >= 3 and added > 0:
+            break  # deep into already-stored territory on an incremental run
+        time.sleep(1.0)
+    return added
+
+
+# ------------------------------------------------------------------
+# VALORANT — PandaScore (structured, real dates, reliable). Free "Fixtures
+# Only" plan covers past matches at 1000 req/hr; token in config.py. Real
+# begin_at dates replace the mirror's relative "ago" guesses, and
+# /matches/past pages back through history. Falls back to the vlr mirror
+# when no token is set (see _fetch_valorant dispatcher below).
+# ------------------------------------------------------------------
+
+PANDASCORE_VAL_URL = ("https://api.pandascore.co/valorant/matches/past"
+                      "?sort=-begin_at&per_page=100&page={page}")
+PANDASCORE_MAX_PAGES = 60  # 100 matches/page; free tier 1000 req/hr, so safe
+
+
+def _fetch_valorant_pandascore(store: dict, teams: dict | None, token: str) -> int:
+    """PandaScore past Valorant matches into the store, keyed by 'ps{id}' so
+    they never collide with vlr-sourced numeric ids. Real begin_at dates."""
+    added, consecutive_known = 0, 0
+    for page in range(1, PANDASCORE_MAX_PAGES + 1):
+        req = urllib.request.Request(
+            PANDASCORE_VAL_URL.format(page=page),
+            headers={"User-Agent": "DivergenceBot/1.0",
+                     "Authorization": f"Bearer {token}",
+                     "Accept": "application/json"},
+        )
+        data = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    data = json.load(r)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    log.warning("PandaScore: 401 Unauthorized — check PANDASCORE_TOKEN")
+                    return added
+                if e.code == 429:  # rate limited — back off and retry
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                log.warning(f"PandaScore valorant page {page}: HTTP {e.code}")
+                time.sleep(2 * (attempt + 1))
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+                time.sleep(2 * (attempt + 1))
+        if not data:
+            log.warning(f"PandaScore valorant: page {page} failed after retries — stopping")
+            break
+        if not isinstance(data, list) or not data:
+            break  # paged past the last result
+        page_added = 0
+        for m in data:
+            if m.get("status") != "finished":
+                continue
+            winner_id = m.get("winner_id")
+            opps = m.get("opponents") or []
+            if not winner_id or len(opps) != 2:
+                continue
+            names = {}
+            for o in opps:
+                t = o.get("opponent") or {}
+                if t.get("id") and t.get("name"):
+                    names[t["id"]] = t["name"]
+            if len(names) != 2 or winner_id not in names:
+                continue
+            winner = names[winner_id]
+            loser = next(n for tid, n in names.items() if tid != winner_id)
+            begin = (m.get("begin_at") or m.get("end_at") or "")[:10]
+            if not begin:
+                continue
+            if teams is not None:
+                for tid, n in names.items():
+                    teams[n] = tid
+            mid = f"ps{m.get('id')}"
+            if mid not in store:
+                store[mid] = [begin, winner, loser]
+                added += 1
+                page_added += 1
+        consecutive_known = consecutive_known + 1 if page_added == 0 else 0
+        if consecutive_known >= 2 and added > 0:
+            break  # incremental run reached already-stored territory
+        time.sleep(0.4)
+    return added
+
+
+def _fetch_valorant(store: dict, team_ids: dict | None = None) -> int:
+    """Dispatcher: PandaScore (structured, real dates) when a token is set in
+    config, else the keyless vlr.gg mirror. On the first tokened run, drops
+    any vlr-sourced entries (plain-numeric ids) so the two sources can't
+    double-count the same match under different ids."""
+    token = getattr(config, "PANDASCORE_TOKEN", "").strip()
+    if not token:
+        return _fetch_valorant_vlr(store, team_ids)
+    stale = [k for k in store if not str(k).startswith("ps")]
+    if stale:
+        log.info(f"valorant: cutting over to PandaScore — dropping {len(stale)} "
+                 f"vlr-sourced entries to avoid cross-source double-count")
+        for k in stale:
+            del store[k]
+    added = _fetch_valorant_pandascore(store, team_ids, token)
+    if added == 0 and not store:
+        log.info("PandaScore returned nothing and store empty — falling back to vlr mirror")
+        return _fetch_valorant_vlr(store, team_ids)
+    return added
+
+
+# ------------------------------------------------------------------
+# Shared build / replay / probability
+# ------------------------------------------------------------------
+
+_FETCHERS = {"dota2": _fetch_dota2, "cs2": _fetch_cs2, "lol": _fetch_lol,
+             "valorant": _fetch_valorant}
+
+
+def fetch_matches(title: str) -> list[tuple[str, str, str]]:
+    """(iso_date, winner, loser) chronological, from the accumulating store
+    after merging in whatever the source exposes right now. Also refreshes
+    the team-name -> source-id sidecar map used by the roster guard."""
+    store = _load_store(title)
+    team_ids = load_team_ids(title)
+    before = len(store)
+    try:
+        added = _FETCHERS[title](store, team_ids)
+    except Exception as e:
+        log.warning(f"{title}: fetch failed ({e}) — using {before} stored matches")
+        added = 0
+    if added:
+        _save_store(title, store)
+    _save_team_ids(title, team_ids)
+    matches = sorted(store.values(), key=lambda m: m[0])
+    log.info(f"{title.upper()}: {len(matches)} matches in store (+{added} new this run)")
+    return [(m[0], m[1], m[2]) for m in matches]
+
+
+def store_latest_date(title: str) -> str | None:
+    """Most recent match date in a title's accumulating store (ISO), or None.
+    Used by the freshness tracker to show how current each esport's data is."""
+    store = _load_store(title)
+    return max((m[0] for m in store.values()), default=None)
+
+
+def recent_match_dates(title: str, team_name: str) -> list[str]:
+    """ISO dates (ascending) of stored matches involving team_name — used by
+    the roster guard to count how many games a team has played since a
+    detected roster change (i.e. whether the Elo has re-equilibrated)."""
+    store = _load_store(title)
+    out = [m[0] for m in store.values() if team_name in (m[1], m[2])]
+    out.sort()
+    return out
+
+
+DOTA_ROSTER_CALLS_PER_RUN = 80  # OpenDota free tier is 2000/day; stay polite
+
+
+def capture_dota_rosters():
+    """Accumulates per-match LINEUPS for stored Dota matches (newest first),
+    capped per run — groundwork for a future Dota player-level Elo (the
+    LoL pilot's approach needs per-match rosters, and OpenDota only serves
+    them one match per call). Run daily via build_ratings.py, this collects
+    ~80 matches/run: recent history fills in within weeks. Sidecar store:
+    {match_id: {"radiant": [account_ids], "dire": [...]}}."""
+    path = STORE_DIR / "esports_dota2_rosters.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            rosters = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        rosters = {}
+    store = _load_store("dota2")
+    todo = sorted((mid for mid in store if mid not in rosters),
+                  key=lambda mid: store[mid][0], reverse=True)[:DOTA_ROSTER_CALLS_PER_RUN]
+    fetched = 0
+    for mid in todo:
+        data = history._get_json(f"https://api.opendota.com/api/matches/{mid}", timeout=25)
+        if not data:
+            continue
+        radiant = [str(pl["account_id"]) for pl in data.get("players", [])
+                   if pl.get("isRadiant") and pl.get("account_id")]
+        dire = [str(pl["account_id"]) for pl in data.get("players", [])
+                if not pl.get("isRadiant") and pl.get("account_id")]
+        if radiant or dire:
+            rosters[mid] = {"radiant": radiant, "dire": dire}
+            fetched += 1
+        time.sleep(1.1)
+    if fetched:
+        STORE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rosters, f)
+    log.info(f"dota2 roster capture: +{fetched} this run, {len(rosters)} total "
+             f"({len(store) - len(rosters)} still unrostered)")
+
+
+def replay(matches: list, p: dict, collect: bool = False) -> tuple[EloEngine, list]:
+    """Chronological replay, same walk-forward contract as every other
+    adapter. Alphabetical player-A ordering for collected predictions —
+    outcome-independent, so calibration buckets stay honest."""
+    engine = EloEngine(k_factor=p["k"])
+    predictions = []
+    for _d, winner, loser in matches:
+        if collect and engine.games(winner) >= p["min_games"] and engine.games(loser) >= p["min_games"]:
+            name_a, name_b = sorted((winner, loser))
+            prob_a = engine.probability(name_a, name_b)
+            predictions.append((prob_a, 1.0 if name_a == winner else 0.0))
+        engine.record_result(winner, loser, 1.0)
+    return engine, predictions
+
+
+def build_engine(title: str) -> tuple[EloEngine, int]:
+    matches = fetch_matches(title)
+    engine, _ = replay(matches, params.get(title))
+    return engine, len(matches)
+
+
+def probability(engine: EloEngine, team_a: str, team_b: str, title: str) -> float | None:
+    p = params.get(title)
+    if engine.games(team_a) < p["min_games"] or engine.games(team_b) < p["min_games"]:
+        return None
+    return engine.probability(team_a, team_b)

@@ -1,0 +1,16 @@
+# Secrets — real API keys, webhooks, tokens. NEVER commit config.py.
+# See config.example.py for the template with placeholders.
+config.py
+
+# Live trading data — real-money positions, not for version control.
+*.db
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Data cache (regenerable via fetch_oe.py / refresh_data.py, 297MB+)
+data/
