@@ -20,6 +20,7 @@ Record for a period always describe the same cohort of bets.
 
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -465,6 +466,140 @@ def attach_discord_error_handler(logger: logging.Logger) -> "DiscordErrorHandler
         webhook, batch_minutes=getattr(config, "ERROR_ALERT_BATCH_MINUTES", 10))
     logger.addHandler(handler)
     return handler
+
+
+# ------------------------------------------------------------------
+# Daily ops digest: read the day's error log, group problems into known
+# categories, and post ONE "what might need fixing" summary to the errors
+# webhook. The live alerts (above) say something happened; this turns a
+# whole day of them into a ranked to-do list.
+# ------------------------------------------------------------------
+
+ERRORS_LOG_FILE = "divergence_bot.errors.log"  # keep in sync with divergence_bot.ERROR_LOG
+
+# (pattern, category title, what-to-fix hint) — first match wins. Extend as
+# new recurring problems show up in the channel.
+_OPS_CATEGORIES = (
+    (r"UNTRACKED", "Untracked orders/positions",
+     "Reconcile positions.db vs the exchange NOW — real money may be untracked"),
+    (r"DB insert failed|database is locked", "Position DB writes failing",
+     "Check positions.db health/locks on the server"),
+    (r"no Elo match for", "Team/player name mismatches",
+     "Add the names to name_match.ALIASES (harvest with suggest_aliases.py)"),
+    (r"STALE ratings|ratings stale", "Ratings not rebuilding",
+     "Refresh pipeline is failing — check refresh_data.log and data sources"),
+    (r"Data refresh exited|reload FAILED|Could not start data refresh", "Data refresh pipeline",
+     "Rebuild subprocess is failing — check refresh_data.log"),
+    (r"player model .*stale|Drive blocked|UNAVAILABLE this run", "LoL player data stale",
+     "Oracle's Elixir fetch blocked — usually Drive quota; retries automatically"),
+    (r"Could not fetch account balance|Balance API|Balance fetch failed", "Balance API failing",
+     "Check API keys and Polymarket status — sizing falls back to cached/estimated balance"),
+    (r"settlement (checks keep failing|endpoint)|Unrecognized settlement", "Settlement problems",
+     "Verify the settlement endpoint/auth; positions may sit open past their game"),
+    (r"Cancel failed|order rejected|orders? create|POSSIBLE UNTRACKED", "Order placement/cancel errors",
+     "Check the orders API and recent order handling in the log"),
+    (r"Could not fetch portfolio|Could not sweep exchange", "Portfolio API failing",
+     "Fill confirmation degraded — check API auth/status"),
+    (r"Unparseable start time", "Market schema drift",
+     "Polymarket changed a field format — update the parser"),
+    (r"Discord .* post failed", "Discord webhooks failing",
+     "Check webhook URLs / Discord status (reports only, trading unaffected)"),
+    (r"Pagination cap|market list may be incomplete|rejected pagination", "Market list pagination",
+     "Market fetching degraded — check SDK/API compatibility"),
+)
+
+
+def _read_todays_errors() -> list[tuple[str, str]]:
+    """[(levelname, message)] for today's lines in the errors log. Timestamps
+    in the log are server-local (logging default), so 'today' is the server's
+    date — good enough for a once-a-day digest."""
+    prefix = datetime.now().strftime("%Y-%m-%d")
+    out = []
+    try:
+        with open(ERRORS_LOG_FILE, encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"(\d{4}-\d{2}-\d{2}) [\d:,]+ (WARNING|ERROR|CRITICAL) (.*)", line)
+                if m and m.group(1) == prefix:
+                    out.append((m.group(2), m.group(3).strip()))
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def _generic_key(msg: str) -> str:
+    """Fallback grouping for messages no category matches: collapse the
+    variable parts (numbers, quoted names, slugs) so repeats group."""
+    s = re.sub(r"'[^']*'|\"[^\"]*\"", "'…'", msg)
+    s = re.sub(r"\b[\w]+(-[\w]+){2,}\b", "<slug>", s)   # market slugs
+    s = re.sub(r"\d+(\.\d+)?", "N", s)
+    return s[:120]
+
+
+def post_discord_ops_digest() -> bool:
+    """One message: today's problems grouped into categories, ranked by
+    severity then volume, each with a what-to-fix hint. Posts a green
+    all-clear when the day had no problems (so silence != broken webhook)."""
+    webhook = getattr(config, "DISCORD_ERRORS_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return False
+    errors = _read_todays_errors()
+    day = datetime.now().strftime("%b %d")
+    if not errors:
+        return _post(webhook, {"username": BOT_NAME, "embeds": [{
+            "title": f"✅ Ops digest — {day}",
+            "description": "No warnings or errors logged today. Nothing needs fixing.",
+            "color": 0x2ECC71,
+        }]}, "ops-digest")
+
+    rank = {"CRITICAL": 2, "ERROR": 1, "WARNING": 0}
+    groups: dict[str, dict] = {}
+    for level, msg in errors:
+        for pat, title, hint in _OPS_CATEGORIES:
+            if re.search(pat, msg, re.I):
+                key, cat_title, cat_hint = title, title, hint
+                break
+        else:
+            key = f"other:{_generic_key(msg)}"
+            cat_title, cat_hint = None, None
+        g = groups.setdefault(key, {"title": cat_title, "hint": cat_hint,
+                                    "count": 0, "worst": 0, "example": msg})
+        g["count"] += 1
+        if rank[level] > g["worst"]:
+            g["worst"], g["example"] = rank[level], msg
+
+    ordered = sorted(groups.values(), key=lambda g: (-g["worst"], -g["count"]))
+    lines = []
+    for g in ordered[:12]:
+        emoji = ("🚨", "🔴", "🟡")[2 - g["worst"]]
+        head = g["title"] or "Uncategorized"
+        lines.append(f"{emoji} **{head}** ×{g['count']}")
+        if g["hint"]:
+            lines.append(f"   fix: {g['hint']}")
+        lines.append(f"   e.g. `{g['example'][:150]}`")
+    if len(ordered) > 12:
+        lines.append(f"…plus {len(ordered) - 12} more group(s) — see the errors log")
+
+    worst = max(g["worst"] for g in ordered)
+    return _post(webhook, {"username": BOT_NAME, "embeds": [{
+        "title": f"🛠️ Ops digest — {day}: {len(errors)} problem(s), {len(ordered)} distinct",
+        "description": "\n".join(lines)[:3900],
+        "color": 0xE74C3C if worst >= 1 else 0xF1C40F,
+        "footer": {"text": "full history: python divergence_bot.py errors"},
+    }]}, "ops-digest")
+
+
+_LAST_OPS_DIGEST_DATE: str | None = None
+
+
+def maybe_post_ops_digest():
+    """Post the ops digest once per day after OPS_DIGEST_HOUR (default 22, in
+    the reporting timezone) — same cadence pattern as the daily P&L digest."""
+    global _LAST_OPS_DIGEST_DATE
+    from db import REPORT_TZ
+    now = datetime.now(REPORT_TZ)
+    if now.hour >= getattr(config, "OPS_DIGEST_HOUR", 22) and today() != _LAST_OPS_DIGEST_DATE:
+        post_discord_ops_digest()
+        _LAST_OPS_DIGEST_DATE = today()
 
 
 def discord_field(label: str, stats: dict, inline: bool) -> dict:

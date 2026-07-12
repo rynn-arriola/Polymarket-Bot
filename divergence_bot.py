@@ -1298,6 +1298,7 @@ def cmd_run():
                 reporting.post_discord_clv("Scheduled CLV report")
                 last_clv_report = time.monotonic()
             reporting.maybe_post_daily_digest()
+            reporting.maybe_post_ops_digest()
             refresher.tick(_reload_ratings)
         except KeyboardInterrupt:
             log.info("Shutting down (Ctrl+C)")
