@@ -24,12 +24,18 @@ log = logging.getLogger("refresh_data")
 def main() -> int:
     t0 = time.monotonic()
 
-    # LoL player data (Oracle's Elixir): idempotent; a no-op once the CSVs
-    # are present, and the path that lands 2024/2025 when Drive frees up.
+    # LoL player data (Oracle's Elixir): idempotent; a no-op once a year's
+    # CSV is present. The year list is DYNAMIC (current year first) — the
+    # current season's file is what keeps the player model inside its
+    # freshness gate, and a hardcoded list is exactly how the model silently
+    # went stale for 6 months in 2026. The current year's CSV grows all
+    # season, so refetch it when the local copy is older than a day.
     try:
         import fetch_oe
-        for year in ("2025", "2024", "2023"):
-            fetch_oe.acquire(year)
+        years = fetch_oe.default_years()
+        for year in years:
+            # years[0] is the current season: refetch daily as it grows.
+            fetch_oe.acquire(year, max_age_days=1 if year == years[0] else None)
     except Exception as e:
         log.warning(f"fetch_oe skipped: {e}")
 
