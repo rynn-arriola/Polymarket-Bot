@@ -131,6 +131,15 @@ LOL_PLAYER_FRESHNESS_DAYS = 45
 # two sources can't double-count the same match under different ids).
 PANDASCORE_TOKEN = _secret("PANDASCORE_TOKEN")
 
+# Which titles use PandaScore for match data AND rosters. The same free
+# token also covers dota2 and cs2 (slug "csgo") with 3-6x deeper history
+# than the keyless sources (verified 2026-07-12: dota2 ~40k matches to
+# 2015, csgo ~95k to 2016, valorant ~18k to 2021) — but a title is only
+# promoted into this tuple after the deeper data BEATS the old source in
+# a walk-forward backtest. Promoting cs2 also activates its first-ever
+# roster guard (PandaScore is the first usable CS2 roster source).
+PANDASCORE_TITLES = ("valorant",)
+
 # --- XGBoost gated layer (future hook) ---
 # A per-sport XGBoost model can TAKE OVER a sport's probability, but only if it
 # beat Elo out-of-sample (train_xgb.py writes beats_elo into the model's meta)

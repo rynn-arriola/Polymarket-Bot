@@ -32,11 +32,13 @@ CACHE_IMMUTABLE_AFTER_DAYS = 3
 ESPN_LIMIT = 900
 
 
-def _get_json(url: str, timeout: int = 30) -> dict | None:
+def _get_json(url: str, timeout: int = 30, headers: dict | None = None) -> dict | None:
     # Explicit User-Agent: several sources (OpenDota, bo3.gg, Fandom/
     # Leaguepedia) 403 the default "Python-urllib/x.y" UA outright —
     # verified live 2026-07-08; the same URLs work with any custom UA.
-    req = urllib.request.Request(url, headers={"User-Agent": "DivergenceBot/1.0"})
+    # `headers` merges on top (e.g. a PandaScore Authorization bearer).
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "DivergenceBot/1.0", **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.load(resp)

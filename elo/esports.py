@@ -355,25 +355,36 @@ def _fetch_valorant_vlr(store: dict, team_ids: dict | None = None) -> int:
 
 
 # ------------------------------------------------------------------
-# VALORANT — PandaScore (structured, real dates, reliable). Free "Fixtures
-# Only" plan covers past matches at 1000 req/hr; token in config.py. Real
-# begin_at dates replace the mirror's relative "ago" guesses, and
-# /matches/past pages back through history. Falls back to the vlr mirror
-# when no token is set (see _fetch_valorant dispatcher below).
+# PANDASCORE — one structured source, three titles. The free "Fixtures
+# Only" token covers valorant, dota2 and csgo (=CS2) past matches at
+# 1000 req/hr, with real begin_at dates and stable team ids (verified
+# 2026-07-12: valorant ~18k matches to 2021, dota2 ~40k to 2015, csgo
+# ~95k to 2016 — 3-6x deeper than the keyless sources). Which titles
+# actually USE it is gated by config.PANDASCORE_TITLES: a title is cut
+# over only after the deeper data measurably beat the old source in a
+# walk-forward backtest, never on faith. Tokenless installs keep the
+# keyless fallbacks (vlr mirror / OpenDota / bo3.gg) with zero change.
 # ------------------------------------------------------------------
 
-PANDASCORE_VAL_URL = ("https://api.pandascore.co/valorant/matches/past"
-                      "?sort=-begin_at&per_page=100&page={page}")
-PANDASCORE_MAX_PAGES = 60  # 100 matches/page; free tier 1000 req/hr, so safe
+PANDASCORE_SLUGS = {"valorant": "valorant", "dota2": "dota2", "cs2": "csgo"}
+PANDASCORE_URL = ("https://api.pandascore.co/{slug}/matches/past"
+                  "?sort=-begin_at&per_page=100&page={page}")
+# Page caps sized to each title's FULL PandaScore history (one-time deep
+# backfill; incremental runs early-stop after ~2 known pages). A run that
+# hits the hourly rate limit saves what it got and RESUMES on the next
+# refresh cycle — the early-stop needs added>0, so re-walking known pages
+# on resume never falsely terminates the deepening.
+PANDASCORE_MAX_PAGES = {"valorant": 200, "dota2": 430, "cs2": 980}
 
 
-def _fetch_valorant_pandascore(store: dict, teams: dict | None, token: str) -> int:
-    """PandaScore past Valorant matches into the store, keyed by 'ps{id}' so
-    they never collide with vlr-sourced numeric ids. Real begin_at dates."""
+def _fetch_pandascore(title: str, store: dict, teams: dict | None, token: str) -> int:
+    """PandaScore past matches for one title into the store, keyed 'ps{id}'
+    so they never collide with the keyless sources' numeric ids."""
+    slug = PANDASCORE_SLUGS[title]
     added, consecutive_known = 0, 0
-    for page in range(1, PANDASCORE_MAX_PAGES + 1):
+    for page in range(1, PANDASCORE_MAX_PAGES[title] + 1):
         req = urllib.request.Request(
-            PANDASCORE_VAL_URL.format(page=page),
+            PANDASCORE_URL.format(slug=slug, page=page),
             headers={"User-Agent": "DivergenceBot/1.0",
                      "Authorization": f"Bearer {token}",
                      "Accept": "application/json"},
@@ -391,15 +402,16 @@ def _fetch_valorant_pandascore(store: dict, teams: dict | None, token: str) -> i
                 if e.code == 429:  # rate limited — back off and retry
                     time.sleep(5 * (attempt + 1))
                     continue
-                log.warning(f"PandaScore valorant page {page}: HTTP {e.code}")
+                log.warning(f"PandaScore {title} page {page}: HTTP {e.code}")
                 time.sleep(2 * (attempt + 1))
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
                 time.sleep(2 * (attempt + 1))
-        if not data:
-            log.warning(f"PandaScore valorant: page {page} failed after retries — stopping")
+        if data is None:
+            log.warning(f"PandaScore {title}: page {page} failed after retries — stopping "
+                        f"(store keeps {len(store)}; next refresh resumes the walk)")
             break
         if not isinstance(data, list) or not data:
-            break  # paged past the last result
+            break  # empty page = paged past the last result (normal, not an error)
         page_added = 0
         for m in data:
             if m.get("status") != "finished":
@@ -435,33 +447,58 @@ def _fetch_valorant_pandascore(store: dict, teams: dict | None, token: str) -> i
     return added
 
 
-def _fetch_valorant(store: dict, team_ids: dict | None = None) -> int:
-    """Dispatcher: PandaScore (structured, real dates) when a token is set in
-    config, else the keyless vlr.gg mirror. On the first tokened run, drops
-    any vlr-sourced entries (plain-numeric ids) so the two sources can't
-    double-count the same match under different ids."""
+def pandascore_enabled(title: str) -> bool:
+    """True when this title should use PandaScore: token present AND the
+    title has been promoted into config.PANDASCORE_TITLES (i.e. the deeper
+    data won its backtest). Rosters key off this too, so match team-ids and
+    the roster provider always agree on WHOSE ids are in the sidecar."""
     token = getattr(config, "PANDASCORE_TOKEN", "").strip()
-    if not token:
-        return _fetch_valorant_vlr(store, team_ids)
+    return bool(token) and title in getattr(config, "PANDASCORE_TITLES", ("valorant",))
+
+
+def _pandascore_or_fallback(title: str, store: dict, team_ids: dict | None,
+                            fallback) -> int:
+    """Dispatcher: PandaScore when enabled for this title, else the keyless
+    fallback. On the first PandaScore run, drops the fallback source's
+    entries (plain-numeric ids) so two sources can't double-count the same
+    match under different ids — and drops the fallback's team-id sidecar
+    entries, which belong to a different id-space entirely."""
+    if not pandascore_enabled(title):
+        return fallback(store, team_ids)
     stale = [k for k in store if not str(k).startswith("ps")]
     if stale:
-        log.info(f"valorant: cutting over to PandaScore — dropping {len(stale)} "
-                 f"vlr-sourced entries to avoid cross-source double-count")
+        log.info(f"{title}: cutting over to PandaScore — dropping {len(stale)} "
+                 f"old-source entries to avoid cross-source double-count")
         for k in stale:
             del store[k]
-    added = _fetch_valorant_pandascore(store, team_ids, token)
+        if team_ids is not None:
+            team_ids.clear()  # old source's team ids — wrong id-space for PandaScore
+    added = _fetch_pandascore(title, store, team_ids,
+                              getattr(config, "PANDASCORE_TOKEN", "").strip())
     if added == 0 and not store:
-        log.info("PandaScore returned nothing and store empty — falling back to vlr mirror")
-        return _fetch_valorant_vlr(store, team_ids)
+        log.info(f"PandaScore returned nothing and {title} store empty — falling back")
+        return fallback(store, team_ids)
     return added
+
+
+def _fetch_valorant(store: dict, team_ids: dict | None = None) -> int:
+    return _pandascore_or_fallback("valorant", store, team_ids, _fetch_valorant_vlr)
+
+
+def _fetch_dota2_dispatch(store: dict, team_ids: dict | None = None) -> int:
+    return _pandascore_or_fallback("dota2", store, team_ids, _fetch_dota2)
+
+
+def _fetch_cs2_dispatch(store: dict, team_ids: dict | None = None) -> int:
+    return _pandascore_or_fallback("cs2", store, team_ids, _fetch_cs2)
 
 
 # ------------------------------------------------------------------
 # Shared build / replay / probability
 # ------------------------------------------------------------------
 
-_FETCHERS = {"dota2": _fetch_dota2, "cs2": _fetch_cs2, "lol": _fetch_lol,
-             "valorant": _fetch_valorant}
+_FETCHERS = {"dota2": _fetch_dota2_dispatch, "cs2": _fetch_cs2_dispatch,
+             "lol": _fetch_lol, "valorant": _fetch_valorant}
 
 
 def fetch_matches(title: str) -> list[tuple[str, str, str]]:
@@ -518,7 +555,10 @@ def capture_dota_rosters():
     except (FileNotFoundError, json.JSONDecodeError):
         rosters = {}
     store = _load_store("dota2")
-    todo = sorted((mid for mid in store if mid not in rosters),
+    # Only OpenDota-sourced (numeric) match ids can be looked up on OpenDota;
+    # after a PandaScore cutover the store holds 'ps*' ids and this capture
+    # idles (the future player model would need a PandaScore lineup source).
+    todo = sorted((mid for mid in store if mid not in rosters and str(mid).isdigit()),
                   key=lambda mid: store[mid][0], reverse=True)[:DOTA_ROSTER_CALLS_PER_RUN]
     fetched = 0
     for mid in todo:
