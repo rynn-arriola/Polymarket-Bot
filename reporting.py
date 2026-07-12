@@ -500,6 +500,9 @@ _OPS_CATEGORIES = (
      "Check the orders API and recent order handling in the log"),
     (r"Could not fetch portfolio|Could not sweep exchange", "Portfolio API failing",
      "Fill confirmation degraded — check API auth/status"),
+    (r"roster fetch failed|fetch failed", "Data-source fetch failures (fail-open)",
+     "Transient source outage (vlr/OpenDota/Leaguepedia/ESPN...) — guards skip, trading continues; "
+     "investigate only if ONE source fails persistently for days"),
     (r"Unparseable start time", "Market schema drift",
      "Polymarket changed a field format — update the parser"),
     (r"Discord .* post failed", "Discord webhooks failing",
