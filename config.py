@@ -138,7 +138,7 @@ PANDASCORE_TOKEN = _secret("PANDASCORE_TOKEN")
 # promoted into this tuple after the deeper data BEATS the old source in
 # a walk-forward backtest. Promoting cs2 also activates its first-ever
 # roster guard (PandaScore is the first usable CS2 roster source).
-PANDASCORE_TITLES = ("valorant",)
+PANDASCORE_TITLES = ("valorant", "dota2", "cs2")
 
 # --- XGBoost gated layer (future hook) ---
 # A per-sport XGBoost model can TAKE OVER a sport's probability, but only if it
