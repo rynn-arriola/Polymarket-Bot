@@ -23,7 +23,7 @@ import logging
 import re
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import config
 from db import db, period_bounds_utc, today
@@ -509,17 +509,25 @@ _OPS_CATEGORIES = (
 )
 
 
-def _read_todays_errors() -> list[tuple[str, str]]:
-    """[(levelname, message)] for today's lines in the errors log. Timestamps
-    in the log are server-local (logging default), so 'today' is the server's
-    date — good enough for a once-a-day digest."""
-    prefix = datetime.now().strftime("%Y-%m-%d")
+def _read_recent_errors(hours: float = 24) -> list[tuple[str, str]]:
+    """[(levelname, message)] for errors-log lines from the last `hours`.
+    A ROLLING window, not calendar-day: a digest posted at 6pm must still
+    cover last evening's problems (peak game time), which a same-date filter
+    would silently drop forever. Log timestamps are server-local (logging
+    default), so compare against local now."""
+    cutoff = datetime.now() - timedelta(hours=hours)
     out = []
     try:
         with open(ERRORS_LOG_FILE, encoding="utf-8") as f:
             for line in f:
-                m = re.match(r"(\d{4}-\d{2}-\d{2}) [\d:,]+ (WARNING|ERROR|CRITICAL) (.*)", line)
-                if m and m.group(1) == prefix:
+                m = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ (WARNING|ERROR|CRITICAL) (.*)", line)
+                if not m:
+                    continue
+                try:
+                    ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if ts >= cutoff:
                     out.append((m.group(2), m.group(3).strip()))
     except FileNotFoundError:
         pass
@@ -542,12 +550,12 @@ def post_discord_ops_digest() -> bool:
     webhook = getattr(config, "DISCORD_ERRORS_WEBHOOK_URL", "").strip()
     if not webhook:
         return False
-    errors = _read_todays_errors()
+    errors = _read_recent_errors(24)
     day = datetime.now().strftime("%b %d")
     if not errors:
         return _post(webhook, {"username": BOT_NAME, "embeds": [{
             "title": f"✅ Ops digest — {day}",
-            "description": "No warnings or errors logged today. Nothing needs fixing.",
+            "description": "No warnings or errors logged in the last 24h. Nothing needs fixing.",
             "color": 0x2ECC71,
         }]}, "ops-digest")
 
@@ -581,7 +589,7 @@ def post_discord_ops_digest() -> bool:
 
     worst = max(g["worst"] for g in ordered)
     return _post(webhook, {"username": BOT_NAME, "embeds": [{
-        "title": f"🛠️ Ops digest — {day}: {len(errors)} problem(s), {len(ordered)} distinct",
+        "title": f"🛠️ Ops digest — {day} (last 24h): {len(errors)} problem(s), {len(ordered)} distinct",
         "description": "\n".join(lines)[:3900],
         "color": 0xE74C3C if worst >= 1 else 0xF1C40F,
         "footer": {"text": "full history: python divergence_bot.py errors"},
