@@ -58,7 +58,14 @@ _roster_cache: dict[tuple[str, str], tuple[float, frozenset | None]] = {}
 # ------------------------------------------------------------------
 
 def _snap_path(title: str) -> Path:
-    return SNAPSHOT_DIR / f"roster_snap_{title}.json"
+    # Snapshots are keyed by PLAYER IDS, whose meaning depends on the roster
+    # source. When a title switches source (e.g. vlr -> PandaScore), old
+    # snapshots are in a foreign id-space — comparing against them would mark
+    # EVERY team "changed" and freeze the title's trading for weeks. A
+    # per-source file makes a source switch start fresh instead (first sight
+    # of each team re-snapshots it as stable).
+    suffix = "_ps" if esports.pandascore_enabled(title) else ""
+    return SNAPSHOT_DIR / f"roster_snap_{title}{suffix}.json"
 
 
 def _load_snaps(title: str) -> dict:
@@ -81,6 +88,10 @@ def _save_snaps(title: str, snaps: dict):
 # ------------------------------------------------------------------
 
 def _dota_roster(team_name: str, team_id) -> frozenset | None:
+    if esports.pandascore_enabled("dota2"):
+        # Match feed is PandaScore -> team_ids are PandaScore ids; the
+        # OpenDota endpoint below would be queried with the wrong id-space.
+        return _pandascore_roster("dota2", team_id)
     if not team_id:
         return None
     data = None
@@ -96,7 +107,35 @@ def _dota_roster(team_name: str, team_id) -> frozenset | None:
     return frozenset(ids) or None
 
 
+def _pandascore_roster(title: str, team_id) -> frozenset | None:
+    """Current roster from PandaScore /{slug}/teams/{id} — the id-space that
+    matches PandaScore-sourced team_ids. Used whenever a title's match data
+    comes from PandaScore, so ids and rosters always agree on their source."""
+    token = getattr(config, "PANDASCORE_TOKEN", "").strip()
+    if not (token and team_id and title in esports.PANDASCORE_SLUGS):
+        return None
+    # Generic /teams/{id} — the videogame-scoped /{slug}/teams/{id} 404s on
+    # the free plan (verified 2026-07-12); the generic one returns the team
+    # with its players directly.
+    data = history._get_json(
+        f"https://api.pandascore.co/teams/{team_id}",
+        timeout=25, headers={"Authorization": f"Bearer {token}"})
+    if isinstance(data, list):  # tolerate list-wrapped responses
+        data = data[0] if data else None
+    players = (data or {}).get("players") or []
+    # Only ACTIVE members — inactive/benched players left in the list would
+    # make the roster diff churn without a real lineup change.
+    ids = {str(p.get("id")) for p in players
+           if p.get("id") and p.get("active") is not False}
+    return frozenset(ids) or None
+
+
 def _valorant_roster(team_name: str, team_id) -> frozenset | None:
+    # PandaScore ids when its match feed is active (the sidecar's team_ids
+    # ARE PandaScore ids then — querying the vlr mirror with them was a live
+    # bug: wrong id-space, constant 404/500s, guard silently inactive).
+    if esports.pandascore_enabled("valorant"):
+        return _pandascore_roster("valorant", team_id)
     if not team_id:
         return None
     data = history._get_json(f"https://vlr.orlandomm.net/api/v1/teams/{team_id}", timeout=25)
@@ -121,11 +160,22 @@ def _lol_roster(team_name: str, team_id) -> frozenset | None:
     return frozenset(ids) or None
 
 
+def _cs2_roster(team_name: str, team_id) -> frozenset | None:
+    """CS2's FIRST roster source: PandaScore, available only once cs2's match
+    feed is cut over to it (the team ids must be PandaScore's). Until then —
+    and on tokenless installs — returns None and the guard no-ops exactly as
+    before (no free keyless roster source exists: bo3 team-filter broken,
+    HLTV blocks scrapers)."""
+    if esports.pandascore_enabled("cs2"):
+        return _pandascore_roster("cs2", team_id)
+    return None
+
+
 _PROVIDERS = {
     "dota2": _dota_roster,
     "valorant": _valorant_roster,
     "lol": _lol_roster,
-    # cs2: intentionally absent — no free roster source (see module docstring)
+    "cs2": _cs2_roster,  # live only when cs2 is promoted into PANDASCORE_TITLES
 }
 
 
