@@ -365,6 +365,108 @@ def _post(webhook: str, payload: dict, what: str) -> bool:
         return False
 
 
+# ------------------------------------------------------------------
+# Ops alerts: forward every WARNING+ log record to a dedicated Discord
+# webhook — the "needs developer attention" channel (API failures, stale
+# models, untracked orders, settlement problems...). Hooked into logging
+# itself so every existing and future log.warning/error/critical in the
+# codebase is covered without instrumenting call sites.
+# ------------------------------------------------------------------
+
+_LEVEL_EMOJI = {"WARNING": "🟡", "ERROR": "🔴", "CRITICAL": "🚨"}
+
+
+class DiscordErrorHandler(logging.Handler):
+    """Batches and dedupes WARNING+ records, then posts one embed.
+
+    Spam control: identical messages within a batch collapse to one line
+    with a ×count; WARNINGs post at most every batch_seconds; ERROR and
+    CRITICAL flush fast (min urgent_gap seconds between posts) because an
+    untracked live order shouldn't wait ten minutes. A failed post keeps
+    the buffer for the next attempt. NEVER raises into the logging call,
+    and never forwards reporting's own logger (a failed webhook post logs
+    a warning — forwarding it would recurse forever).
+    """
+
+    MAX_PENDING = 40          # unique messages held per batch; extras are counted
+    MAX_LINE = 200            # chars of each message shown
+
+    def __init__(self, webhook: str, batch_minutes: float = 10,
+                 urgent_gap_seconds: float = 60):
+        super().__init__(level=logging.WARNING)
+        self.webhook = webhook
+        self.batch_seconds = batch_minutes * 60
+        self.urgent_gap = urgent_gap_seconds
+        self.pending: dict[str, dict] = {}   # key -> {level, levelno, msg, first, count}
+        self.dropped = 0
+        self.last_post = 0.0                 # monotonic; 0 = first problem posts immediately
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            if record.name.startswith("divergence_bot.reporting"):
+                return
+            msg = record.getMessage()
+            key = f"{record.levelname}|{msg[:300]}"
+            entry = self.pending.get(key)
+            if entry:
+                entry["count"] += 1
+            elif len(self.pending) < self.MAX_PENDING:
+                from db import REPORT_TZ
+                self.pending[key] = {
+                    "level": record.levelname, "levelno": record.levelno,
+                    "msg": msg, "count": 1,
+                    "first": datetime.now(REPORT_TZ).strftime("%H:%M"),
+                }
+            else:
+                self.dropped += 1
+            import time
+            now = time.monotonic()
+            gap = self.urgent_gap if record.levelno >= logging.ERROR else self.batch_seconds
+            if now - self.last_post >= gap:
+                self._flush(now)
+        except Exception:
+            pass  # a broken alert channel must never break the bot
+
+    def _flush(self, now: float):
+        if not self.pending:
+            return
+        self.last_post = now  # even on failure — never hammer Discord
+        entries = sorted(self.pending.values(), key=lambda e: -e["levelno"])
+        lines = []
+        for e in entries:
+            count = f" ×{e['count']}" if e["count"] > 1 else ""
+            text = e["msg"][: self.MAX_LINE] + ("…" if len(e["msg"]) > self.MAX_LINE else "")
+            lines.append(f"{_LEVEL_EMOJI.get(e['level'], '⚪')} `{e['first']}`{count} {text}")
+        desc = "\n".join(lines)[:3800]
+        if self.dropped:
+            desc += f"\n…plus {self.dropped} more (see divergence_bot.errors.log)"
+        worst = entries[0]["levelno"]
+        payload = {
+            "username": BOT_NAME,
+            "embeds": [{
+                "title": "🚨 Needs attention" if worst >= logging.CRITICAL
+                         else "🔴 Errors" if worst >= logging.ERROR else "🟡 Warnings",
+                "description": desc,
+                "color": 0xE74C3C if worst >= logging.ERROR else 0xF1C40F,
+                "footer": {"text": "full history: python divergence_bot.py errors"},
+            }],
+        }
+        if _post(self.webhook, payload, "error-alert"):
+            self.pending.clear()
+            self.dropped = 0
+
+
+def attach_discord_error_handler(logger: logging.Logger) -> "DiscordErrorHandler | None":
+    """Attach the ops-alert handler (no-op when the webhook isn't configured)."""
+    webhook = getattr(config, "DISCORD_ERRORS_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return None
+    handler = DiscordErrorHandler(
+        webhook, batch_minutes=getattr(config, "ERROR_ALERT_BATCH_MINUTES", 10))
+    logger.addHandler(handler)
+    return handler
+
+
 def discord_field(label: str, stats: dict, inline: bool) -> dict:
     # CLV intentionally NOT shown here — it lives on its own webhook
     # (post_discord_clv), kept off the status/summary channel.

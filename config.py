@@ -256,6 +256,16 @@ DISCORD_SETTLEMENT_WEBHOOK_URL = _secret("DISCORD_SETTLEMENT_WEBHOOK_URL")
 DISCORD_CLV_WEBHOOK_URL = _secret("DISCORD_CLV_WEBHOOK_URL")
 CLV_REPORT_TIMES_PER_DAY = 4
 
+# Optional: a dedicated OPS/ERRORS webhook — the "needs developer attention"
+# channel. Every WARNING and above the bot logs (API failures, stale
+# ratings/models, unrecognized data formats, untracked orders, settlement
+# problems) is forwarded here automatically, deduplicated and batched every
+# ERROR_ALERT_BATCH_MINUTES; ERROR/CRITICAL flush within ~a minute. Same
+# content as divergence_bot.errors.log / `python divergence_bot.py errors`,
+# pushed instead of pulled. Blank = disabled.
+DISCORD_ERRORS_WEBHOOK_URL = _secret("DISCORD_ERRORS_WEBHOOK_URL")
+ERROR_ALERT_BATCH_MINUTES = 10
+
 # --- Reporting timezone ---
 REPORT_TIMEZONE = "America/New_York"
 

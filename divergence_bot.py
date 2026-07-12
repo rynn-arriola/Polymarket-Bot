@@ -58,6 +58,11 @@ log = logging.getLogger("divergence_bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+# Ops alerts: WARNING+ records are ALSO pushed to a dedicated Discord webhook
+# (config.DISCORD_ERRORS_WEBHOOK_URL) — deduped, batched, CRITICAL posts fast.
+# Attached to the root logger so every module's problems are covered.
+reporting.attach_discord_error_handler(logging.getLogger())
+
 try:
     from polymarket_us import BadRequestError, PolymarketUS
 except ImportError:
