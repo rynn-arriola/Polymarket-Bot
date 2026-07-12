@@ -1,16 +1,28 @@
 # ============================================================
-# DIVERGENCE BOT CONFIG — TEMPLATE
-# Copy this to config.py and fill in your own credentials.
-# config.py is gitignored — never commit real secrets.
+# DIVERGENCE BOT CONFIG — strategy/tuning knobs (safe to commit).
+# Secrets live in credentials.py (gitignored) or environment
+# variables — see credentials.example.py. Never paste them here.
 # ============================================================
+import os
 from datetime import date
 
+try:
+    import credentials as _cred
+except ImportError:
+    _cred = None
+
+
+def _secret(name: str, default: str = "") -> str:
+    """Env var first (server/CI friendly), then credentials.py, then default.
+    Defaults keep the existing 'PASTE_YOUR' startup guard working when
+    neither source provides a value."""
+    return os.environ.get(name) or getattr(_cred, name, "") or default
+
+
 # --- API credentials (from polymarket.us/developer) ---
-# Paste your own KEY_ID/SECRET_KEY between the quotes — this is a separate,
-# standalone project from the existing bot.py, with its own credentials,
-# database, and log file. NEVER share these with anyone.
-KEY_ID = "PASTE_YOUR_KEY_ID"
-SECRET_KEY = "PASTE_YOUR_SECRET_KEY"
+# Set in credentials.py (copy credentials.example.py) or as env vars.
+KEY_ID = _secret("KEY_ID", "PASTE_YOUR_KEY_ID")
+SECRET_KEY = _secret("SECRET_KEY", "PASTE_YOUR_SECRET_KEY")
 
 # --- KILL SWITCH ---
 # False = dry-run: bot logs every order it WOULD place, no real money.
@@ -18,7 +30,7 @@ SECRET_KEY = "PASTE_YOUR_SECRET_KEY"
 # Run dry for a good stretch first — this strategy has never traded before,
 # unlike the existing band-filter bot. Judge nothing before ~100 settled
 # positions AND a `python backtest.py` calibration table that looks sane.
-LIVE = False
+LIVE = True
 
 # --- Strategy: divergence entries ---
 # Our own Elo-derived win probability vs. Polymarket's current mid price
@@ -117,7 +129,7 @@ LOL_PLAYER_FRESHNESS_DAYS = 45
 # On the first run WITH a token, the accumulating store cuts over to
 # PandaScore automatically (old mirror-sourced entries are dropped so the
 # two sources can't double-count the same match under different ids).
-PANDASCORE_TOKEN = ""
+PANDASCORE_TOKEN = _secret("PANDASCORE_TOKEN")
 
 # --- XGBoost gated layer (future hook) ---
 # A per-sport XGBoost model can TAKE OVER a sport's probability, but only if it
@@ -200,7 +212,8 @@ DRY_RUN_BANKROLL = 1000.00   # fixed simulated bankroll for DRY-RUN, decoupled f
 # $0.05-$0.95, so a sub-$1 stake can buy zero of them.
 STAKE_PCT = 0.01             # flat sizing: 1% of bankroll per bet (ACTIVE — Kelly off below)
 KELLY_FRACTION = 0           # 0 = Kelly OFF, every bet is a flat STAKE_PCT of bankroll.
-                             # Set to e.g. 0.25 for quarter-Kelly edge-scaled sizing instead.
+                             # (Was 0.25 quarter-Kelly until 2026-07-12 — edge-scaled bets
+                             # kept hitting the 2% MAX_STAKE_PCT cap; restore 0.25 to re-enable.)
 MAX_STAKE_PCT = 0.02         # hard cap: never risk more than 2% of bankroll on one bet
 MIN_STAKE = 1.00             # absolute $ floor (whole-contract minimum)
 MAX_OPEN_POSITIONS = 10
@@ -224,20 +237,23 @@ SETTLEMENT_STUCK_WARNING_DAYS = 14
 # --- Discord status updates ---
 # Optional: paste a Discord channel webhook URL to receive bot summaries
 # (status every DISCORD_STATUS_INTERVAL_MIN minutes + a once-daily digest
-# with per-sport records and divergence-bucket edge validation). Keep URLs
-# private: anyone with one can post into that channel. Blank = disabled.
-DISCORD_WEBHOOK_URL = ""
+# with per-sport records and divergence-bucket edge validation). You can
+# reuse the webhooks from the other bot's config.py — both bots' messages
+# will then share a channel, distinguished by username — or make a fresh
+# channel + webhook to keep this bot's reporting separate. Keep URLs
+# private: anyone with one can post into that channel.
+DISCORD_WEBHOOK_URL = _secret("DISCORD_WEBHOOK_URL")
 DISCORD_STATUS_INTERVAL_MIN = 30
 
 # Optional: a second webhook for one polished message per settled position
 # (includes what the model believed vs what the market charged at entry).
-DISCORD_SETTLEMENT_WEBHOOK_URL = ""
+DISCORD_SETTLEMENT_WEBHOOK_URL = _secret("DISCORD_SETTLEMENT_WEBHOOK_URL")
 
 # Optional: a dedicated webhook for the CLV (closing-line value) report — the
 # fastest read on whether the edge is real (does the market move toward our
 # bets by tip-off?). Posted on its own channel, CLV_REPORT_TIMES_PER_DAY times
 # a day (4 = every 6h). Blank = no CLV report posted.
-DISCORD_CLV_WEBHOOK_URL = ""
+DISCORD_CLV_WEBHOOK_URL = _secret("DISCORD_CLV_WEBHOOK_URL")
 CLV_REPORT_TIMES_PER_DAY = 4
 
 # --- Reporting timezone ---

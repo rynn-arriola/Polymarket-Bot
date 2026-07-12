@@ -1,6 +1,7 @@
-# Secrets — real API keys, webhooks, tokens. NEVER commit config.py.
-# See config.example.py for the template with placeholders.
-config.py
+# Secrets — real API keys, webhooks, tokens live in credentials.py.
+# NEVER commit it. Template: credentials.example.py (config.py itself
+# holds only strategy knobs now and IS tracked).
+credentials.py
 
 # Live trading data — real-money positions, not for version control.
 *.db
