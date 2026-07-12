@@ -268,7 +268,7 @@ ERROR_ALERT_BATCH_MINUTES = 10
 # Once a day (after this hour, reporting timezone) the same channel gets an
 # OPS DIGEST: the day's problems grouped into categories with a what-to-fix
 # hint each — a ranked to-do list distilled from all of the day's alerts.
-OPS_DIGEST_HOUR = 22
+OPS_DIGEST_HOUR = 18   # 6pm ET
 
 # --- Reporting timezone ---
 REPORT_TIMEZONE = "America/New_York"
