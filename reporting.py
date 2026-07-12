@@ -583,7 +583,10 @@ def post_discord_ops_digest() -> bool:
         lines.append(f"{emoji} **{head}** ×{g['count']}")
         if g["hint"]:
             lines.append(f"   fix: {g['hint']}")
-        lines.append(f"   e.g. `{g['example'][:150]}`")
+        # Keep the raw log line generous — these digests get copy-pasted
+        # into a triage chat, and the specifics (slug, name, exception)
+        # are what make the paste actionable.
+        lines.append(f"   e.g. `{g['example'][:220]}`")
     if len(ordered) > 12:
         lines.append(f"…plus {len(ordered) - 12} more group(s) — see the errors log")
 
