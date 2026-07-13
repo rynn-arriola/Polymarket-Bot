@@ -75,8 +75,12 @@ def stats_for_period(kind: str) -> dict:
     won = count("AND status='won'")
     lost = count("AND status='lost'")
     push = count("AND status='push'")
+    # P&L/staked are explicitly scoped to SETTLED statuses, not just
+    # pnl IS NOT NULL — a hand-repaired or anomalous row (e.g. a cancelled
+    # row carrying a pnl) must never leak into the totals silently.
     pnl = db(
-        f"SELECT COALESCE(SUM(pnl),0) FROM positions WHERE {created_filter} AND pnl IS NOT NULL",
+        f"""SELECT COALESCE(SUM(pnl),0) FROM positions WHERE {created_filter}
+            AND pnl IS NOT NULL AND status IN ('won','lost','push')""",
         args, fetch=True,
     )[0][0]
     avg_div = db(
@@ -96,7 +100,8 @@ def stats_for_period(kind: str) -> dict:
     # Yield = realized P&L as a share of money actually staked (settled bets) —
     # the return-on-turnover health metric, independent of bankroll size.
     staked = db(
-        f"SELECT COALESCE(SUM(stake),0) FROM positions WHERE {created_filter} AND pnl IS NOT NULL",
+        f"""SELECT COALESCE(SUM(stake),0) FROM positions WHERE {created_filter}
+            AND pnl IS NOT NULL AND status IN ('won','lost','push')""",
         args, fetch=True,
     )[0][0]
     return {
@@ -126,7 +131,8 @@ def stats_by_sport() -> list[dict]:
                    SUM(CASE WHEN status='won' THEN 1 ELSE 0 END) AS won,
                    SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END) AS lost,
                    SUM(CASE WHEN status='push' THEN 1 ELSE 0 END) AS push,
-                   COALESCE(SUM(pnl), 0) AS pnl
+                   COALESCE(SUM(CASE WHEN status IN ('won','lost','push')
+                                     THEN pnl ELSE 0 END), 0) AS pnl
             FROM positions
             WHERE live = ?
             GROUP BY sport""",
