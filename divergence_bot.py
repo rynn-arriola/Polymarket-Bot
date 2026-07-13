@@ -734,11 +734,14 @@ def _recover_order(auth, slug: str, requested_qty: int):
             return str(o.get("id") or "RECOVERED"), qty, "pending"
     # Not among open orders — it may have filled immediately (a filled order
     # leaves the open list). The dup guard guarantees we held no prior position
-    # on this slug, so a portfolio hit can only be this order.
-    held: set = set()
-    _collect_slugs(auth.portfolio.positions(), held)
-    if slug in held:
-        return "RECOVERED", requested_qty, "open"
+    # on this slug, so any held quantity can only be this order. Per-market
+    # lookup (not the paginated full listing); an inconclusive lookup raises so
+    # the caller treats the order as possibly live rather than absent.
+    qty = _position_quantity(auth, slug)
+    if qty is None:
+        raise RuntimeError("portfolio position lookup failed")
+    if qty > 0:
+        return "RECOVERED", min(_as_int(qty), requested_qty) or requested_qty, "open"
     return None
 
 
@@ -754,6 +757,10 @@ def guard_untracked_exchange_state(auth):
     exchange_slugs: set = set()
     try:
         _collect_slugs(auth.orders.list(), exchange_slugs)
+        # NOTE: the unfiltered positions listing is paginated — beyond one
+        # page this sweep's coverage degrades (it may MISS untracked slugs,
+        # which is fail-open and safe; it can never wrongly flag one). The
+        # decision paths that must be exact use _position_quantity instead.
         _collect_slugs(auth.portfolio.positions(), exchange_slugs)
     except Exception as e:
         log.warning(f"Could not sweep exchange state for untracked orders: {e}")
@@ -901,6 +908,40 @@ def _collect_slugs(obj, out):
             _collect_slugs(item, out)
 
 
+def _position_quantity(client, slug: str) -> float | None:
+    """Net position held on ONE market, asked with the API's market filter.
+    Returns 0.0 for 'definitively no position', a positive count if held, or
+    None when the lookup itself failed (callers must treat that as
+    inconclusive, never as absence).
+
+    This replaces 'list the whole portfolio and collect slugs': that listing
+    is PAGINATED, and once the account held more positions than one page,
+    everything past it looked absent — three FILLED orders were marked
+    'cancelled' exactly that way (2026-07-13, ~$31 of settled losses
+    invisible to the bot until reconciled by hand)."""
+    try:
+        resp = client.portfolio.positions({"market": slug})
+    except NotFoundError:
+        return 0.0  # filter matched nothing — no position on this market
+    except Exception as e:
+        log.warning(f"Position lookup failed for {slug}: {e}")
+        return None
+    positions = resp.get("positions") if isinstance(resp, dict) else None
+    if positions is None:
+        return None
+    entries = (list(positions.values()) if isinstance(positions, dict)
+               else positions if isinstance(positions, list) else [])
+    total = 0.0
+    for p in entries:
+        if not isinstance(p, dict):
+            continue
+        try:
+            total += float(p.get("netPosition") or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
 def _order_state(client, order_id: str) -> tuple[str, int] | None:
     """(state, cumQuantity filled) for an order, or None if it can't be
     fetched — callers then fall back to the coarser portfolio-presence check."""
@@ -950,7 +991,6 @@ def confirm_fills(client):
               "WHERE status='pending' AND live=1", fetch=True)
     if not rows:
         return
-    held = None  # portfolio fetched lazily, only when an order lookup is inconclusive
     for pid, slug, order_id, price, quantity in rows:
         st = _order_state(client, order_id)
         if isinstance(st, tuple):
@@ -969,20 +1009,18 @@ def confirm_fills(client):
             # (cancel_stale_orders resolves it at the CANCEL_UNFILLED_AFTER_MIN mark).
             continue
         # st is "NOT_FOUND" (definitively gone) or None (transient failure).
-        # Both fall back to the portfolio: a held slug means it filled and the
-        # order was consumed; an absent slug means no position. Only NOT_FOUND
-        # cancels an absent row — a transient failure leaves it pending to retry
-        # (so a blip can't wrongly cancel a live resting order).
-        if held is None:
-            held = set()
-            try:
-                _collect_slugs(client.portfolio.positions(), held)
-            except Exception as e:
-                log.warning(f"Could not fetch portfolio positions: {e}")
-                return
-        if slug in held:
-            db("UPDATE positions SET status='open' WHERE id=?", (pid,))
-            log.info(f"Fill confirmed on {slug} (portfolio fallback)")
+        # Either way, ask the portfolio about THIS market specifically — the
+        # per-market filter can't be fooled by pagination the way the full
+        # listing was. Only NOT_FOUND cancels an absent row — a transient
+        # failure leaves it pending to retry (a blip can't wrongly cancel a
+        # live resting order), and an inconclusive lookup (None) never
+        # decides anything.
+        qty = _position_quantity(client, slug)
+        if qty is None:
+            continue  # lookup failed — retry next cycle
+        if qty > 0:
+            _mark_open(pid, slug, price, quantity,
+                       min(_as_int(qty), _as_int(quantity)) or _as_int(quantity))
         elif st == "NOT_FOUND":
             db("UPDATE positions SET status='cancelled' WHERE id=?", (pid,))
             log.info(f"Order {order_id} on {slug} not found on the exchange and no position "
@@ -1025,14 +1063,13 @@ def cancel_stale_orders(client):
                 db("UPDATE positions SET status='cancelled' WHERE id=?", (pid,))
                 log.info(f"Cancelled unfilled order on {slug} after {age_min:.0f} min")
             continue
-        held = set()
-        try:
-            _collect_slugs(client.portfolio.positions(), held)
-        except Exception as e:
-            log.warning(f"Post-cancel fill check failed for {slug}: {e} — leaving as pending")
+        qty = _position_quantity(client, slug)
+        if qty is None:
+            log.warning(f"Post-cancel fill check inconclusive for {slug} — leaving as pending")
             continue
-        if slug in held:
-            db("UPDATE positions SET status='open' WHERE id=?", (pid,))
+        if qty > 0:
+            _mark_open(pid, slug, price, quantity,
+                       min(_as_int(qty), _as_int(quantity)) or _as_int(quantity))
             log.info(f"Order on {slug} FILLED just before cancel — tracked as open")
         else:
             db("UPDATE positions SET status='cancelled' WHERE id=?", (pid,))
