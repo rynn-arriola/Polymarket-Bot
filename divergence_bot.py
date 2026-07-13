@@ -64,7 +64,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 reporting.attach_discord_error_handler(logging.getLogger())
 
 try:
-    from polymarket_us import BadRequestError, PolymarketUS
+    from polymarket_us import BadRequestError, NotFoundError, PolymarketUS
 except ImportError:
     print("Missing SDK. Run:  pip install polymarket-us")
     sys.exit(1)
@@ -913,6 +913,11 @@ def _order_state(client, order_id: str) -> tuple[str, int] | None:
         if not state:
             return None
         return state, _as_int(order.get("cumQuantity"), 0)
+    except NotFoundError:
+        # The exchange has no such order — definitively gone (never rested, or
+        # already purged). Distinct from a transient failure: callers resolve
+        # it immediately instead of re-checking (and re-logging) every cycle.
+        return "NOT_FOUND"
     except Exception as e:
         log.warning(f"Could not fetch order {order_id}: {e}")
         return None
@@ -945,10 +950,10 @@ def confirm_fills(client):
               "WHERE status='pending' AND live=1", fetch=True)
     if not rows:
         return
-    held = None  # portfolio fetched lazily, only if an order lookup fails
+    held = None  # portfolio fetched lazily, only when an order lookup is inconclusive
     for pid, slug, order_id, price, quantity in rows:
         st = _order_state(client, order_id)
-        if st is not None:
+        if isinstance(st, tuple):
             state, filled = st
             if state == "ORDER_STATE_FILLED":
                 _mark_open(pid, slug, price, quantity, filled or quantity)
@@ -963,8 +968,11 @@ def confirm_fills(client):
             # NEW / PARTIALLY_FILLED / PENDING_* -> still working, stays pending
             # (cancel_stale_orders resolves it at the CANCEL_UNFILLED_AFTER_MIN mark).
             continue
-        # Fallback: the pre-existing portfolio-presence check (can't see
-        # partial sizes, but better than nothing when order lookup fails).
+        # st is "NOT_FOUND" (definitively gone) or None (transient failure).
+        # Both fall back to the portfolio: a held slug means it filled and the
+        # order was consumed; an absent slug means no position. Only NOT_FOUND
+        # cancels an absent row — a transient failure leaves it pending to retry
+        # (so a blip can't wrongly cancel a live resting order).
         if held is None:
             held = set()
             try:
@@ -975,6 +983,10 @@ def confirm_fills(client):
         if slug in held:
             db("UPDATE positions SET status='open' WHERE id=?", (pid,))
             log.info(f"Fill confirmed on {slug} (portfolio fallback)")
+        elif st == "NOT_FOUND":
+            db("UPDATE positions SET status='cancelled' WHERE id=?", (pid,))
+            log.info(f"Order {order_id} on {slug} not found on the exchange and no position "
+                     f"held — marked cancelled")
 
 
 def cancel_stale_orders(client):
@@ -1000,9 +1012,11 @@ def cancel_stale_orders(client):
             continue
         # The order itself is the authority on what filled before the cancel
         # landed — cumQuantity catches PARTIAL fills, which the portfolio
-        # presence check below cannot size.
+        # presence check below cannot size. A "NOT_FOUND" string (order already
+        # gone) falls through to the portfolio check like a transient miss —
+        # but here we've just cancelled it, so an absent slug means cancelled.
         st = _order_state(client, order_id)
-        if st is not None:
+        if isinstance(st, tuple):
             state, filled = st
             if filled > 0:
                 _mark_open(pid, slug, price, quantity, filled)

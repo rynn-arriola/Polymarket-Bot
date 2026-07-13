@@ -32,6 +32,14 @@ except ZoneInfoNotFoundError:
 
 def db_init():
     con = sqlite3.connect(DB)
+    # WAL: readers (the `status`/reporting queries) and the writer no longer
+    # block each other, so a scan-cycle INSERT can't lose to "database is
+    # locked" while a report reads — that contention on the small server left
+    # a REAL order untracked (2026-07-12). journal_mode is a persistent
+    # property of the file, so setting it once here sticks for every later
+    # connection; synchronous=NORMAL is the safe, faster pairing under WAL.
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
     con.execute(
         """CREATE TABLE IF NOT EXISTS positions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
