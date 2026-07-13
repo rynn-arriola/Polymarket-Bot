@@ -59,6 +59,14 @@ ALIASES: dict[str, str] = {
 
 FUZZY_CUTOFF = 0.85
 
+# Names already warned about this run. A market stays in the scan for hours,
+# so an unmatched name otherwise re-warns EVERY cycle — one ITF weekend put
+# 870 duplicate warnings in the ops digest (2026-07-13) and drowned the
+# signal. First miss warns; repeats log at DEBUG. (A ratings hot-reload can
+# make a name resolvable later — then resolve() simply succeeds and the
+# stale entry here is harmless.)
+_WARNED_UNMATCHED: set[str] = set()
+
 
 def resolve(polymarket_name: str, known_names) -> str | None:
     """Maps a Polymarket team/player name to the matching name key used in
@@ -102,5 +110,9 @@ def resolve(polymarket_name: str, known_names) -> str | None:
     if matches:
         log.info(f"fuzzy-matched {polymarket_name!r} -> {matches[0]!r} — verify and add to ALIASES if wrong")
         return matches[0]
-    log.warning(f"no Elo match for {polymarket_name!r} — add to name_match.ALIASES once you find the source name")
+    if polymarket_name in _WARNED_UNMATCHED:
+        log.debug(f"no Elo match for {polymarket_name!r} (repeat)")
+    else:
+        _WARNED_UNMATCHED.add(polymarket_name)
+        log.warning(f"no Elo match for {polymarket_name!r} — add to name_match.ALIASES once you find the source name")
     return None
