@@ -765,15 +765,23 @@ def post_discord_clv(reason: str = "CLV update") -> bool:
     if not webhook:
         return False
 
+    # Overall CLV drives the whole embed's color + headline verdict, so the
+    # green/red read is instant even on mobile (where ANSI in code blocks does
+    # not render — the emoji and sidebar color do).
+    overall = stats_for_period("overall")
+    overall_clv = overall.get("avg_clv") if overall.get("clv_n") else None
+
     period_lines = [f"{'period':<10}{'avg CLV':>9}{'beat':>7}{'n':>6}"]
     for label, kind in (("Today", "today"), ("This Week", "week"), ("Overall", "overall")):
         s = stats_for_period(kind)
         if s.get("clv_n"):
             code = "32" if s["avg_clv"] > 0 else "31" if s["avg_clv"] < 0 else "2;37"
-            period_lines.append(f"\x1b[{code}m{label:<10}{s['avg_clv']:>+9.2%}"
+            # Leading emoji renders everywhere; it sits OUTSIDE the fixed-width
+            # columns so it can't throw off the monospace alignment.
+            period_lines.append(f"\x1b[{code}m{pnl_emoji(s['avg_clv'])} {label:<8}{s['avg_clv']:>+9.2%}"
                                 f"{s['clv_beat']:>7.0%}{s['clv_n']:>6}\x1b[0m")
         else:
-            period_lines.append(f"{label:<10}{'--':>9}{'--':>7}{0:>6}")
+            period_lines.append(f"⚪ {label:<8}{'--':>9}{'--':>7}{0:>6}")
     fields = [{
         "name": "CLV by period",
         "value": "```ansi\n" + "\n".join(period_lines) + "\n```",
@@ -786,9 +794,9 @@ def post_discord_clv(reason: str = "CLV update") -> bool:
         for r in div_rows:
             if r.get("avg_clv") is not None:
                 code = "32" if r["avg_clv"] > 0 else "31" if r["avg_clv"] < 0 else "2;37"
-                bl.append(f"\x1b[{code}m{r['bucket']:<9}{r['avg_clv']:>+9.2%}{r['clv_n']:>6}\x1b[0m")
+                bl.append(f"\x1b[{code}m{pnl_emoji(r['avg_clv'])} {r['bucket']:<7}{r['avg_clv']:>+9.2%}{r['clv_n']:>6}\x1b[0m")
             else:
-                bl.append(f"{r['bucket']:<9}{'--':>9}{r['clv_n']:>6}")
+                bl.append(f"⚪ {r['bucket']:<7}{'--':>9}{r['clv_n']:>6}")
         fields.append({
             "name": "CLV by divergence size (bigger gap should beat the close more)",
             "value": "```ansi\n" + "\n".join(bl) + "\n```",
@@ -812,13 +820,25 @@ def post_discord_clv(reason: str = "CLV update") -> bool:
             })
 
     mode_badge = "🔴 LIVE" if config.LIVE else "🧪 DRY-RUN"
+    # Headline verdict from overall CLV: green embed + 🟢 = the market is
+    # moving toward our bets (edge looks real); red + 🔴 = moving against us;
+    # neutral until there's data. Falls back to the brand teal when no CLV
+    # has been captured yet (nothing to color).
+    if overall_clv is None:
+        sidebar, verdict = 0x1ABC9C, "⚪ No CLV captured yet"
+    else:
+        sidebar = embed_color(overall_clv)
+        verdict = (f"{pnl_emoji(overall_clv)} Overall CLV {overall_clv:+.2%} — "
+                   + ("market moving TOWARD our bets (edge looks real)" if overall_clv > 0
+                      else "market moving AGAINST our bets" if overall_clv < 0
+                      else "flat"))
     payload = {
         "username": BOT_NAME,
         "embeds": [{
-            "title": "📉 Polybot CLV Report",
-            "description": f"{reason} — CLV = how far the market moved toward our bets by tip-off. "
-                           "Consistently positive = real edge.",
-            "color": 0x1ABC9C,
+            "title": f"{pnl_emoji(overall_clv) if overall_clv is not None else '📉'} Polybot CLV Report",
+            "description": f"**{verdict}**\n{reason} — CLV = how far the market moved toward our "
+                           "bets by tip-off. Consistently positive = real edge.",
+            "color": sidebar,
             "fields": fields,
             "footer": {"text": f"{BOT_NAME} | {mode_badge}"},
             "timestamp": datetime.now(timezone.utc).isoformat(),
