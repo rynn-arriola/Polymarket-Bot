@@ -110,11 +110,17 @@ def _effective_gap(engine: EloEngine, p: dict, home: str, away: str,
 
 
 def replay(games: list[dict], p: dict, collect: bool = False,
-           season_regress: float = 1 / 3) -> tuple[EloEngine, list]:
+           season_regress: float = 1 / 3, feature_fn=None) -> tuple[EloEngine, list]:
     """Runs every game through the model in chronological order. With
     collect=True, also returns walk-forward (predicted_prob, home_won)
     pairs — each prediction made BEFORE that game updates any rating, i.e.
-    with exactly the information the live bot would have had."""
+    with exactly the information the live bot would have had.
+
+    feature_fn (optional): if given, the collected pairs are
+    (feature_fn(engine, home, away, home_pitcher, away_pitcher), home_won)
+    instead of (prob, home_won) — lets the XGBoost trainer harvest the full
+    feature vector at each game's pre-update state, reusing this exact replay
+    (pitcher seeding and all) so training can't drift from the live model."""
     engine = EloEngine(k_factor=p["k"])
     pitchers = engine.extras.setdefault("pitchers", {})
     predictions = []
@@ -170,7 +176,12 @@ def replay(games: list[dict], p: dict, collect: bool = False,
         home_won = g["hs"] > g["as_"]
 
         if collect and engine.games(home) >= p["min_games"] and engine.games(away) >= p["min_games"]:
-            predictions.append((exp_home, 1.0 if home_won else 0.0))
+            label = 1.0 if home_won else 0.0
+            if feature_fn is not None:
+                predictions.append((feature_fn(engine, home, away,
+                                               g["home_pitcher"], g["away_pitcher"]), label))
+            else:
+                predictions.append((exp_home, label))
 
         margin = abs(g["hs"] - g["as_"])
         diff_winner = gap if home_won else -gap

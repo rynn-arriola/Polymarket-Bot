@@ -20,10 +20,18 @@ import xgboost as xgb
 import config
 import xgb_features as xf
 import xgb_live
-from elo import basketball, params
+from elo import basketball, mlb, params, soccer
+
+# A model must beat Elo's test Brier by AT LEAST this much to be flagged
+# beats_elo (and so become live-eligible). Without a margin, a noise-level
+# 0.0005 "win" on Elo-only features trips the gate — verified live on dota2
+# 2026-07-12. This encodes "meaningfully better than Elo", not "not worse".
+BEAT_MARGIN = 0.002
 
 # Convention each sport's model predicts on (for xgb_live to map back).
-ORDER = {"nba": "home", "wnba": "home", "atp": "alpha", "wta": "alpha"}
+ORDER = {"nba": "home", "wnba": "home", "mlb": "home", "fwc": "home",
+         "atp": "alpha", "wta": "alpha",
+         "dota2": "alpha", "cs2": "alpha", "lol": "alpha", "valorant": "alpha"}
 
 TRAIN_FRAC, VAL_FRAC = 0.70, 0.15  # test = remaining 15%, most-recent games
 
@@ -83,6 +91,19 @@ def load_matrix(sport: str):
                                            config.TENNIS_TML_START_YEAR)
         X, y = xf.extract_tennis(matches, sport)
         feats = xf.TENNIS_FEATURES
+    elif sport == "mlb":
+        games = mlb.fetch_games(config.MLB_START_YEAR)
+        X, y = xf.extract_mlb(games)
+        feats = xf.MLB_FEATURES
+    elif sport == "fwc":
+        games = soccer.fetch_games()
+        X, y = xf.extract_fwc(games)
+        feats = xf.FWC_FEATURES
+    elif sport in xgb_live.ESPORTS_TITLES:
+        from elo import esports
+        matches = esports.fetch_matches(sport)   # (date, winner, loser), from the local store
+        X, y = xf.extract_esports(matches, sport)
+        feats = xf.BASE_FEATURES
     else:
         raise SystemExit(f"no XGB feature extractor for {sport!r}")
     M = np.array([[row[c] for c in feats] for row in X], dtype=float)
@@ -100,7 +121,8 @@ def _save_model(sport, bst, best_it, feats, cal, order, elo_b, xgb_b):
         "calibration": {"a": round(cal[0], 4), "b": round(cal[1], 4)},
         "order": order,
         "best_iteration": int(best_it),
-        "beats_elo": bool(xgb_b < elo_b),
+        "beats_elo": bool(xgb_b < elo_b - BEAT_MARGIN),
+        "beat_margin": BEAT_MARGIN,
         "elo_brier": round(elo_b, 4),
         "xgb_brier": round(xgb_b, 4),
         "trained_at": datetime.now(timezone.utc).isoformat(),
@@ -153,8 +175,10 @@ def main(sport: str):
     print(f"  XGB   test Brier : {xgb_cal_b:.4f}   Platt-calibrated (a={a:.3f}, b={b:+.3f})")
     print("=" * 52)
     delta = elo_b - xgb_b
-    verdict = "XGB BEATS Elo" if delta > 0 else "Elo wins"
-    print(f"  -> {verdict} by {abs(delta):.4f} Brier ({'+' if delta>0 else '-'}{abs(delta)/elo_b:.1%})\n")
+    beats = xgb_b < elo_b - BEAT_MARGIN
+    verdict = (f"XGB BEATS Elo (>{BEAT_MARGIN} margin) — ACTIVATES" if beats
+               else "ties/loses Elo — stays inactive" if delta <= BEAT_MARGIN else "XGB edges Elo but under margin")
+    print(f"  -> {verdict}: delta {delta:+.4f} Brier ({delta/elo_b:+.1%})\n")
 
     print("XGB calibration on test:")
     print(calibration_table(cal_te if keep_cal else raw_te, yte))

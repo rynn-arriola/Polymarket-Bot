@@ -62,11 +62,16 @@ def fetch_games() -> list[dict]:
     return games
 
 
-def replay(games: list[dict], p: dict, collect: bool = False) -> tuple[EloEngine, list]:
+def replay(games: list[dict], p: dict, collect: bool = False,
+           feature_fn=None) -> tuple[EloEngine, list]:
     """Chronological replay; with collect=True also returns walk-forward
     (predicted_win_prob_home, home_won_outright) pairs — win probability
     after draw decomposition, since that's the number the bot actually
-    trades on."""
+    trades on.
+
+    feature_fn (optional): if given, the collected pairs are
+    (feature_fn(engine, home, away), home_won_outright) instead of
+    (prob, ...) — for the XGBoost trainer, reusing this exact replay."""
     engine = EloEngine(k_factor=p["k"])
     predictions = []
     for g in games:
@@ -76,8 +81,12 @@ def replay(games: list[dict], p: dict, collect: bool = False) -> tuple[EloEngine
         home_won = g["hs"] > g["as_"]
 
         if collect and engine.games(home) >= p["min_games"] and engine.games(away) >= p["min_games"]:
-            win_home, _draw, _win_away = decompose_win_draw_loss(exp_home, p["draw_rate"])
-            predictions.append((win_home, 1.0 if home_won else 0.0))
+            label = 1.0 if home_won else 0.0
+            if feature_fn is not None:
+                predictions.append((feature_fn(engine, home, away), label))
+            else:
+                win_home, _draw, _win_away = decompose_win_draw_loss(exp_home, p["draw_rate"])
+                predictions.append((win_home, label))
 
         margin = abs(g["hs"] - g["as_"])
         diff_winner = gap if home_won else -gap

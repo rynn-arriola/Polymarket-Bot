@@ -35,6 +35,16 @@ log = logging.getLogger("divergence_bot.xgb_live")
 MODELS_DIR = Path(__file__).resolve().parent / "xgb_models"
 
 # Feature contracts (order matters — training and inference must agree).
+#
+# BASE_FEATURES is the universal Elo vector any two-outcome sport can produce
+# from its engine alone — the "feed Elo to XGBoost" baseline that works
+# everywhere. A sport's list is BASE_FEATURES + whatever EXTRA orthogonal
+# signal it has data for (NBA adds rest/back-to-back, tennis adds surface).
+# Adding a feature later = append to that sport's list here and to its
+# extractor; the gate then decides whether it earns activation.
+BASE_FEATURES = ["elo_exp", "elo_gap", "rating_a", "rating_b",
+                 "games_a", "games_b"]
+
 NBA_FEATURES = ["elo_gap", "elo_exp", "rating_home", "rating_away",
                 "rest_home", "rest_away", "b2b_home", "b2b_away",
                 "games_home", "games_away"]
@@ -42,8 +52,24 @@ TENNIS_FEATURES = ["elo_exp", "overall_gap", "surface_gap", "surf_known",
                    "rating_a", "rating_b", "surf_games_a", "surf_games_b",
                    "games_a", "games_b", "is_clay", "is_grass"]
 
+# MLB decomposes its Elo signal into team vs. starting-pitcher components —
+# elo_exp is the pitcher-aware home win prob the live model actually trades.
+MLB_FEATURES = ["elo_exp", "team_gap", "pitcher_gap",
+                "rating_home", "rating_away", "games_home", "games_away"]
+# FWC (World Cup): elo_exp is the draw-decomposed P(home wins OUTRIGHT), the
+# number the single-team markets settle on.
+FWC_FEATURES = ["elo_exp", "elo_gap", "rating_home", "rating_away",
+                "games_home", "games_away"]
+
+# Esports (and any future title-based sport) use the universal base vector —
+# no orthogonal data yet, so this is the honest Elo-only baseline until
+# per-match lineups / series-format / tier features land (see XGBOOST_PLAN.md).
+ESPORTS_TITLES = ("dota2", "cs2", "lol", "valorant")
+
 FEATURES_FOR = {"nba": NBA_FEATURES, "wnba": NBA_FEATURES,
-                "atp": TENNIS_FEATURES, "wta": TENNIS_FEATURES}
+                "atp": TENNIS_FEATURES, "wta": TENNIS_FEATURES,
+                "mlb": MLB_FEATURES, "fwc": FWC_FEATURES,
+                **{t: BASE_FEATURES for t in ESPORTS_TITLES}}
 
 
 # ------------------------------------------------------------------
@@ -59,6 +85,66 @@ def _rest_days(last_played: dict, team: str, game_date: str) -> int:
         return min((date.fromisoformat(game_date) - date.fromisoformat(prev)).days, 14)
     except (ValueError, TypeError):
         return 7
+
+
+def base_features(engine, a: str, b: str) -> dict:
+    """Universal Elo feature vector for a two-outcome match, from the engine
+    alone — shared by training and inference so they can never drift. `a`/`b`
+    are in the sport's prediction order (esports: alphabetical, predicts
+    P(a beats b)). Extend a sport by adding features ALONGSIDE these, never by
+    changing these."""
+    gap = engine.get_rating(a) - engine.get_rating(b)
+    return {
+        "elo_exp": engine.probability(a, b),
+        "elo_gap": gap,
+        "rating_a": engine.get_rating(a),
+        "rating_b": engine.get_rating(b),
+        "games_a": engine.games(a),
+        "games_b": engine.games(b),
+    }
+
+
+def mlb_features(engine, home: str, away: str, home_pitcher=None, away_pitcher=None) -> dict:
+    """MLB feature vector, home perspective (predicts P(home wins)). elo_exp is
+    the SAME pitcher-aware probability mlb.probability produces live; team_gap
+    and pitcher_gap expose the two components separately so the trees can weight
+    them. Shared by training (via the replay callback) and inference."""
+    from elo import mlb, params
+    p = params.get("mlb")
+    pitchers = engine.extras.get("pitchers", {})
+    team_gap = engine.get_rating(home) - engine.get_rating(away)
+    ph = mlb._pitcher_rating(pitchers, home_pitcher)
+    pa = mlb._pitcher_rating(pitchers, away_pitcher)
+    eff_gap = team_gap + p["home_adv"] + p["pitcher_weight"] * (ph - pa)
+    return {
+        "elo_exp": 1.0 / (1.0 + 10 ** (-eff_gap / 400.0)),
+        "team_gap": team_gap,
+        "pitcher_gap": ph - pa,
+        "rating_home": engine.get_rating(home),
+        "rating_away": engine.get_rating(away),
+        "games_home": engine.games(home),
+        "games_away": engine.games(away),
+    }
+
+
+def fwc_features(engine, home: str, away: str) -> dict:
+    """World Cup feature vector, home perspective. elo_exp is P(home wins
+    OUTRIGHT) after draw decomposition — the number the single-team markets
+    settle on — matching soccer.probability."""
+    from elo import params
+    from elo.engine import decompose_win_draw_loss
+    p = params.get("fwc")
+    gap = engine.get_rating(home) - engine.get_rating(away)
+    raw = 1.0 / (1.0 + 10 ** (-gap / 400.0))
+    win_home, _draw, _win_away = decompose_win_draw_loss(raw, p["draw_rate"])
+    return {
+        "elo_exp": win_home,
+        "elo_gap": gap,
+        "rating_home": engine.get_rating(home),
+        "rating_away": engine.get_rating(away),
+        "games_home": engine.games(home),
+        "games_away": engine.games(away),
+    }
 
 
 def basketball_features(engine, league: str, home: str, away: str, game_date: str) -> dict:
@@ -182,9 +268,18 @@ def predict(sport: str, engine, name_a: str, name_b: str, ctx: dict) -> float | 
     flip = False
     if sport in ("nba", "wnba"):
         feats = basketball_features(engine, sport, name_a, name_b, ctx.get("game_date"))
+    elif sport == "mlb":
+        feats = mlb_features(engine, name_a, name_b,
+                             ctx.get("home_pitcher"), ctx.get("away_pitcher"))
+    elif sport == "fwc":
+        feats = fwc_features(engine, name_a, name_b)
     elif sport in ("atp", "wta"):
         a, b = sorted((name_a, name_b))
         feats = tennis_features(engine, sport, a, b, ctx.get("surface"))
+        flip = a != name_a  # model gives P(alphabetical-first); flip to name_a
+    elif sport in ESPORTS_TITLES:
+        a, b = sorted((name_a, name_b))
+        feats = base_features(engine, a, b)
         flip = a != name_a  # model gives P(alphabetical-first); flip to name_a
     else:
         return None

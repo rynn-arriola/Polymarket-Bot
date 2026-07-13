@@ -15,3 +15,7 @@ __pycache__/
 
 # Data cache (regenerable via fetch_oe.py / refresh_data.py, 297MB+)
 data/
+
+# Trained XGBoost model binaries — regenerable via train_xgb.py, and they
+# reach the server via scp when they earn activation, not via git.
+xgb_models/

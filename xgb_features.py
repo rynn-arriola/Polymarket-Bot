@@ -11,11 +11,14 @@ strictly pre-game (same min_games gate as the Elo backtest).
 from datetime import date
 
 import xgb_live
-from elo import basketball, params, tennis
+from elo import basketball, esports, mlb, params, soccer, tennis
 from elo.engine import EloEngine, mov_multiplier
 
 FEATURES = xgb_live.NBA_FEATURES
 TENNIS_FEATURES = xgb_live.TENNIS_FEATURES
+BASE_FEATURES = xgb_live.BASE_FEATURES
+MLB_FEATURES = xgb_live.MLB_FEATURES
+FWC_FEATURES = xgb_live.FWC_FEATURES
 
 
 def extract_nba(games: list[dict], league: str = "nba", season_regress: float = 1 / 3):
@@ -49,6 +52,40 @@ def extract_nba(games: list[dict], league: str = "nba", season_regress: float = 
         last_played[home] = g["date"]
         last_played[away] = g["date"]
 
+    return X, y
+
+
+def extract_mlb(games: list[dict]):
+    """MLB (predicts P(home wins)). Reuses mlb.replay's exact pitcher-aware
+    walk-forward via the feature callback, so training features match the live
+    model with zero duplicated seeding logic."""
+    _, preds = mlb.replay(games, params.get("mlb"), collect=True,
+                          feature_fn=xgb_live.mlb_features)
+    return [f for f, _ in preds], [y for _, y in preds]
+
+
+def extract_fwc(games: list[dict]):
+    """World Cup (predicts P(home wins outright). Reuses soccer.replay's draw-
+    decomposed walk-forward via the feature callback."""
+    _, preds = soccer.replay(games, params.get("fwc"), collect=True,
+                             feature_fn=xgb_live.fwc_features)
+    return [f for f, _ in preds], [y for _, y in preds]
+
+
+def extract_esports(matches: list[tuple[str, str, str]], title: str):
+    """Esports (dota2/cs2/lol/valorant): alphabetical order, predicts P(first
+    wins). Mirrors esports.replay EXACTLY (same K, same record order) so the
+    emitted feature vector matches what the live engine holds at prediction
+    time — walk-forward, strictly pre-game via the same min_games gate."""
+    p = params.get(title)
+    engine = EloEngine(k_factor=p["k"])
+    X, y = [], []
+    for _date, winner, loser in matches:
+        if engine.games(winner) >= p["min_games"] and engine.games(loser) >= p["min_games"]:
+            a, b = sorted((winner, loser))
+            X.append(xgb_live.base_features(engine, a, b))
+            y.append(1 if a == winner else 0)
+        engine.record_result(winner, loser, 1.0)
     return X, y
 
 

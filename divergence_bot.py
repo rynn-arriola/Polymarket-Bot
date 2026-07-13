@@ -304,9 +304,15 @@ def _sport_probability(sport_key: str, engine: EloEngine, name_a: str, name_b: s
     # The XGB prob is self-calibrated; the XGB-capable sports carry an identity
     # Elo Platt, so evaluate_market's apply_calibration is a no-op on top of it.
     if xgb_live.has_model(sport_key):
-        ctx = {"game_date": (event_start_time(m) or datetime.now(timezone.utc)).date().isoformat()}
+        start = event_start_time(m) or datetime.now(timezone.utc)
+        ctx = {"game_date": start.date().isoformat()}
         if sport_key in ("atp", "wta"):
             ctx["surface"] = tennis.current_surface(sport_key)
+        elif sport_key == "mlb":
+            # Same probable-starter lookup the Elo path uses, so the XGB
+            # pitcher features match live reality (name_a=home, name_b=away).
+            ctx["home_pitcher"] = mlb.pitcher_for(name_a, start.date())
+            ctx["away_pitcher"] = mlb.pitcher_for(name_b, start.date())
         xp = xgb_live.predict(sport_key, engine, name_a, name_b, ctx)
         if xp is not None:
             return xp
