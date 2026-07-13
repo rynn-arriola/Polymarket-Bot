@@ -78,8 +78,16 @@ DEFAULTS: dict[str, dict] = {
     # shift fast, so recent results should dominate. min_games modest since
     # several sources only expose a sliding recent window until the
     # accumulating store deepens.
-    "dota2": {"k": 40.0, "min_games": 8, "calibration": {"a": 1.0, "b": 0.0}},
-    "cs2": {"k": 40.0, "min_games": 8, "calibration": {"a": 1.0, "b": 0.0}},
+    # inactivity_days/regress: one-shot regression toward the mean when a
+    # team returns from a long idle spell (roster/meta have usually moved
+    # on; the stale rating otherwise reads as a fat fake divergence live).
+    # dota2/cs2 only — measured win there (2026-07-13: dormant-game Brier
+    # 0.2257->0.2213 / 0.2288->0.2222); no benefit measured for valorant
+    # (n=69, noise) and LoL's 12-month window barely has dormancy.
+    "dota2": {"k": 40.0, "min_games": 8, "inactivity_days": 90, "inactivity_regress": 0.35,
+              "calibration": {"a": 1.0, "b": 0.0}},
+    "cs2": {"k": 40.0, "min_games": 8, "inactivity_days": 90, "inactivity_regress": 0.35,
+            "calibration": {"a": 1.0, "b": 0.0}},
     "lol": {"k": 40.0, "min_games": 8, "calibration": {"a": 1.0, "b": 0.0}},
     "valorant": {"k": 40.0, "min_games": 8, "calibration": {"a": 1.0, "b": 0.0}},
 }
