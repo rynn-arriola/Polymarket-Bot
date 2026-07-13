@@ -5,6 +5,8 @@ credentials.py
 
 # Live trading data — real-money positions, not for version control.
 *.db
+*.db-wal
+*.db-shm
 
 # Logs
 *.log
