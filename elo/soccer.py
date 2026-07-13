@@ -83,7 +83,7 @@ def replay(games: list[dict], p: dict, collect: bool = False,
         if collect and engine.games(home) >= p["min_games"] and engine.games(away) >= p["min_games"]:
             label = 1.0 if home_won else 0.0
             if feature_fn is not None:
-                predictions.append((feature_fn(engine, home, away), label))
+                predictions.append((feature_fn(engine, home, away, g["date"]), label))
             else:
                 win_home, _draw, _win_away = decompose_win_draw_loss(exp_home, p["draw_rate"])
                 predictions.append((win_home, label))

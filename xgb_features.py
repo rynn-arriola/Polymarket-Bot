@@ -26,7 +26,7 @@ def extract_nba(games: list[dict], league: str = "nba", season_regress: float = 
     p = params.get(league)
     engine = EloEngine(k_factor=p["k"])
     last_played = engine.extras.setdefault("last_played", {})
-    X, y = [], []
+    X, y, dates = [], [], []
     prev_date = None
 
     for g in games:
@@ -43,6 +43,7 @@ def extract_nba(games: list[dict], league: str = "nba", season_regress: float = 
         if engine.games(home) >= p["min_games"] and engine.games(away) >= p["min_games"]:
             X.append(xgb_live.basketball_features(engine, league, home, away, g["date"]))
             y.append(1 if home_won else 0)
+            dates.append(g["date"])
 
         gap = basketball._gap(engine, p, home, away, g["date"])
         margin = abs(g["hs"] - g["as_"])
@@ -52,7 +53,7 @@ def extract_nba(games: list[dict], league: str = "nba", season_regress: float = 
         last_played[home] = g["date"]
         last_played[away] = g["date"]
 
-    return X, y
+    return X, y, dates
 
 
 def extract_mlb(games: list[dict]):
@@ -60,16 +61,20 @@ def extract_mlb(games: list[dict]):
     walk-forward via the feature callback, so training features match the live
     model with zero duplicated seeding logic."""
     _, preds = mlb.replay(games, params.get("mlb"), collect=True,
-                          feature_fn=xgb_live.mlb_features)
-    return [f for f, _ in preds], [y for _, y in preds]
+                          feature_fn=lambda e, h, a, hp, ap, d:
+                              (xgb_live.mlb_features(e, h, a, hp, ap), d))
+    return ([f for (f, _d), _ in preds], [y for _, y in preds],
+            [d for (_f, d), _ in preds])
 
 
 def extract_fwc(games: list[dict]):
     """World Cup (predicts P(home wins outright). Reuses soccer.replay's draw-
     decomposed walk-forward via the feature callback."""
     _, preds = soccer.replay(games, params.get("fwc"), collect=True,
-                             feature_fn=xgb_live.fwc_features)
-    return [f for f, _ in preds], [y for _, y in preds]
+                             feature_fn=lambda e, h, a, d:
+                                 (xgb_live.fwc_features(e, h, a), d))
+    return ([f for (f, _d), _ in preds], [y for _, y in preds],
+            [d for (_f, d), _ in preds])
 
 
 def extract_esports(matches: list[tuple[str, str, str]], title: str):
@@ -79,21 +84,22 @@ def extract_esports(matches: list[tuple[str, str, str]], title: str):
     time — walk-forward, strictly pre-game via the same min_games gate."""
     p = params.get(title)
     engine = EloEngine(k_factor=p["k"])
-    X, y = [], []
+    X, y, dates = [], [], []
     for _date, winner, loser in matches:
         if engine.games(winner) >= p["min_games"] and engine.games(loser) >= p["min_games"]:
             a, b = sorted((winner, loser))
             X.append(xgb_live.base_features(engine, a, b))
             y.append(1 if a == winner else 0)
+            dates.append(_date)
         engine.record_result(winner, loser, 1.0)
-    return X, y
+    return X, y, dates
 
 
 def extract_tennis(matches: list[dict], tour: str):
     """Tennis (atp/wta): alphabetical player order, predicts P(first wins)."""
     p = params.get(tour)
     engine = EloEngine(k_factor=p["k"])
-    X, y = [], []
+    X, y, dates = [], [], []
 
     for m in matches:
         winner, loser = m["winner"], m["loser"]
@@ -102,8 +108,9 @@ def extract_tennis(matches: list[dict], tour: str):
             a, b = sorted((winner, loser))
             X.append(xgb_live.tennis_features(engine, tour, a, b, surface))
             y.append(1 if a == winner else 0)
+            dates.append(m.get("date") or "")
 
         engine.record_result(winner, loser, 1.0)
         engine.record_result(tennis._skey(winner, surface), tennis._skey(loser, surface), 1.0)
 
-    return X, y
+    return X, y, dates

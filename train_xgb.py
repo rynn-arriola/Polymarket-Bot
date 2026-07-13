@@ -85,37 +85,39 @@ def calibration_table(pred, actual, bins=10):
 
 
 def load_matrix(sport: str):
-    """Returns (feature_matrix, labels, feature_names) for a sport."""
+    """Returns (feature_matrix, labels, feature_names, dates) for a sport.
+    dates align 1:1 with rows (ISO strings) — the recency-weighting
+    experiments need each row's age; plain training ignores them."""
     if sport in ("nba", "wnba"):
         start = config.NBA_START_DATE if sport == "nba" else config.WNBA_START_DATE
         games = basketball.fetch_games(sport, start, date.today())
-        X, y = xf.extract_nba(games, sport)
+        X, y, dates = xf.extract_nba(games, sport)
         feats = xf.FEATURES
     elif sport in ("atp", "wta"):
         from elo import tennis
         matches = tennis.fetch_matches_for(sport, config.TENNIS_START_DATE, date.today(),
                                            config.TENNIS_TML_START_YEAR)
-        X, y = xf.extract_tennis(matches, sport)
+        X, y, dates = xf.extract_tennis(matches, sport)
         feats = xf.TENNIS_FEATURES
     elif sport == "mlb":
         games = mlb.fetch_games(config.MLB_START_YEAR)
-        X, y = xf.extract_mlb(games)
+        X, y, dates = xf.extract_mlb(games)
         feats = xf.MLB_FEATURES
     elif sport == "fwc":
         games = soccer.fetch_games()
-        X, y = xf.extract_fwc(games)
+        X, y, dates = xf.extract_fwc(games)
         feats = xf.FWC_FEATURES
     elif sport in xgb_live.ESPORTS_TITLES:
         from elo import esports
         if OFFLINE:
             esports._FETCHERS = {**esports._FETCHERS, sport: (lambda s, t=None: 0)}
         matches = esports.fetch_matches(sport)   # (date, winner, loser), from the local store
-        X, y = xf.extract_esports(matches, sport)
+        X, y, dates = xf.extract_esports(matches, sport)
         feats = xf.BASE_FEATURES
     else:
         raise SystemExit(f"no XGB feature extractor for {sport!r}")
     M = np.array([[row[c] for c in feats] for row in X], dtype=float)
-    return M, np.asarray(y, float), feats
+    return M, np.asarray(y, float), feats, dates
 
 
 def _save_model(sport, bst, best_it, feats, cal, order, elo_b, xgb_b):
@@ -141,7 +143,7 @@ def _save_model(sport, bst, best_it, feats, cal, order, elo_b, xgb_b):
 
 
 def main(sport: str):
-    M, y, feats = load_matrix(sport)
+    M, y, feats, _dates = load_matrix(sport)
     n = len(y)
     tr, va = int(n * TRAIN_FRAC), int(n * (TRAIN_FRAC + VAL_FRAC))
     Xtr, ytr = M[:tr], y[:tr]

@@ -179,7 +179,8 @@ def replay(games: list[dict], p: dict, collect: bool = False,
             label = 1.0 if home_won else 0.0
             if feature_fn is not None:
                 predictions.append((feature_fn(engine, home, away,
-                                               g["home_pitcher"], g["away_pitcher"]), label))
+                                               g["home_pitcher"], g["away_pitcher"],
+                                               g["date"]), label))
             else:
                 predictions.append((exp_home, label))
 
