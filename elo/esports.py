@@ -377,6 +377,25 @@ PANDASCORE_URL = ("https://api.pandascore.co/{slug}/matches/past"
 PANDASCORE_MAX_PAGES = {"valorant": 200, "dota2": 430, "cs2": 980}
 
 
+def _match_bo(m: dict):
+    """Best-of length (1/3/5...) from a PandaScore match, or None."""
+    try:
+        bo = int(m.get("number_of_games"))
+        return bo if bo > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _match_tier(m: dict):
+    """Tournament tier letter ('s','a','b','c','d') from a PandaScore match,
+    or None. Tournament tier is the reliable field; serie.tier is often null."""
+    for src in ("tournament", "serie"):
+        t = (m.get(src) or {}).get("tier")
+        if t:
+            return str(t).lower()
+    return None
+
+
 def _fetch_pandascore(title: str, store: dict, teams: dict | None, token: str) -> int:
     """PandaScore past matches for one title into the store, keyed 'ps{id}'
     so they never collide with the keyless sources' numeric ids."""
@@ -437,7 +456,10 @@ def _fetch_pandascore(title: str, store: dict, teams: dict | None, token: str) -
                     teams[n] = tid
             mid = f"ps{m.get('id')}"
             if mid not in store:
-                store[mid] = [begin, winner, loser]
+                # 5-field entry: [date, winner, loser, bo_format, tier].
+                # bo/tier feed the XGB context features (exp 3); readers
+                # tolerate legacy 3-field entries (missing context -> NaN).
+                store[mid] = [begin, winner, loser, _match_bo(m), _match_tier(m)]
                 added += 1
                 page_added += 1
         consecutive_known = consecutive_known + 1 if page_added == 0 else 0
@@ -445,6 +467,113 @@ def _fetch_pandascore(title: str, store: dict, teams: dict | None, token: str) -
             break  # incremental run reached already-stored territory
         time.sleep(0.4)
     return added
+
+
+def _ctx_cursor_path(title: str):
+    return STORE_DIR / f"esports_{title}_ctx_cursor.json"
+
+
+def enrich_pandascore_context(title: str, max_pages: int | None = None) -> dict:
+    """RESUMABLE historical walk that back-fills bo_format/tier onto existing
+    store entries (and adds any matches the store is missing — this also
+    completes valorant's never-finished deep backfill). Walks newest-first
+    from a saved page cursor; a rate-limited/failed page saves progress and
+    returns, so repeated runs converge. Returns the cursor state.
+
+    Only needed once per title (then the fetcher writes 5-field entries for
+    everything new). Server-side this matters only if a context model ever
+    ships; until then it's a research-side tool."""
+    import urllib.request as _rq
+    token = getattr(config, "PANDASCORE_TOKEN", "").strip()
+    if not token or title not in PANDASCORE_SLUGS:
+        return {"done": False, "page": 0, "error": "no token/slug"}
+    path = _ctx_cursor_path(title)
+    try:
+        cursor = json.load(open(path, encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        cursor = {"page": 0, "done": False}
+    if cursor.get("done"):
+        return cursor
+    store = _load_store(title)
+    team_ids = load_team_ids(title)
+    slug = PANDASCORE_SLUGS[title]
+    limit = max_pages or PANDASCORE_MAX_PAGES[title]
+    page = cursor["page"]
+    updated = added = 0
+    while page < limit:
+        page += 1
+        req = _rq.Request(
+            PANDASCORE_URL.format(slug=slug, page=page),
+            headers={"User-Agent": "DivergenceBot/1.0",
+                     "Authorization": f"Bearer {token}",
+                     "Accept": "application/json"})
+        data = None
+        for attempt in range(3):
+            try:
+                with _rq.urlopen(req, timeout=30) as r:
+                    data = json.load(r)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                break
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+                time.sleep(2 * (attempt + 1))
+        if data is None:
+            page -= 1  # retry this page next run
+            break
+        if not isinstance(data, list) or not data:
+            cursor["done"] = True
+            break
+        for m in data:
+            if m.get("status") != "finished":
+                continue
+            winner_id = m.get("winner_id")
+            opps = m.get("opponents") or []
+            names = {(o.get("opponent") or {}).get("id"): (o.get("opponent") or {}).get("name")
+                     for o in opps if (o.get("opponent") or {}).get("id")}
+            if len(names) != 2 or winner_id not in names:
+                continue
+            begin = (m.get("begin_at") or m.get("end_at") or "")[:10]
+            if not begin:
+                continue
+            winner = names[winner_id]
+            loser = next(n for tid, n in names.items() if tid != winner_id)
+            if team_ids is not None:
+                for tid, n in names.items():
+                    team_ids[n] = tid
+            mid = f"ps{m.get('id')}"
+            entry = [begin, winner, loser, _match_bo(m), _match_tier(m)]
+            if mid not in store:
+                added += 1
+            elif len(store[mid]) < 5:
+                updated += 1
+            store[mid] = entry
+        time.sleep(0.4)
+    cursor["page"] = page
+    _save_store(title, store)
+    _save_team_ids(title, team_ids)
+    STORE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cursor, f)
+    log.info(f"{title} context enrichment: thru page {page}/{limit} "
+             f"(+{added} new, {updated} enriched) {'DONE' if cursor.get('done') else '— resumable'}")
+    return cursor
+
+
+def matches_with_context(title: str) -> list[tuple]:
+    """(date, winner, loser, bo_format, tier) chronological from the store —
+    bo/tier are None for legacy 3-field entries (features go NaN, per P6).
+    Store-only (no fetch): the exp-3 training reader."""
+    store = _load_store(title)
+    out = []
+    for m in store.values():
+        bo = m[3] if len(m) > 3 else None
+        tier = m[4] if len(m) > 4 else None
+        out.append((m[0], m[1], m[2], bo, tier))
+    out.sort(key=lambda r: r[0])
+    return out
 
 
 def pandascore_enabled(title: str) -> bool:
