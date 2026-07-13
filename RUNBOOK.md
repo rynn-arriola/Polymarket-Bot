@@ -14,6 +14,10 @@ tmux session `bot`, code in `/root/divergence-bot`. Local dev copy:
    of files.
 3. **Config/code changes flow local → git → scp → restart.** Don't hand-edit
    files on the server (they get overwritten by the next deploy).
+   **Never scp generated data** (`elo_ratings.json`, `elo_freshness.json`,
+   `data/`): the server rebuilds those itself every 6h and its copies are
+   fresher than yours. (If ever clobbered by accident they self-heal on the
+   next refresh — unlike positions.db, which never does.)
 4. **One strategy change per week**, decided from the edge report.
 5. **When anything looks wrong: paste it to Claude** (Discord alert, digest,
    audit output, weird numbers). The triage maps live in memory.
