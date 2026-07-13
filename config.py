@@ -242,6 +242,12 @@ LONG_ONLY = False
 # checks keep failing, warn (throttled) — surfaces a broken/auth-expired
 # settlement endpoint instead of silently never settling anything.
 SETTLEMENT_STUCK_WARNING_DAYS = 14
+# The exchange RESTATES a resolution's cost basis (rolls fees in) shortly
+# after posting it — P&L read earlier sticks slightly optimistic (audited
+# 2026-07-13: 16 rows, ~$10.6 overstated). Settlement still fires instantly,
+# but the figure is only stamped FINAL once the resolution activity is at
+# least this old; until then reconcile_live_pnl keeps refreshing it.
+RESOLUTION_STABLE_MINUTES = 45
 
 # --- Discord status updates ---
 # Optional: paste a Discord channel webhook URL to receive bot summaries
