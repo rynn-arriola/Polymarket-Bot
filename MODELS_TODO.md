@@ -29,7 +29,7 @@ to main without explicit approval.
 | MLB | Best calibration, sharpest market | — most likely first CLV-pause candidate; no model work |
 | FWC | World Cup ends 2026-07-19 | [ ] post-final: sport goes dormant — nothing to do, volume just stops |
 | dota2 | Deep PandaScore + dormancy patch | [ ] deploy confirmation (above); then — watch CLV |
-| cs2 | Deep PandaScore + first roster guard | [ ] same |
+| cs2 | Deep PandaScore + first roster guard | [ ] same; NEW: [ ] retune k/calibration on the enrichment-deepened store (52k->88.6k matches) — pairs with valorant's retune as one evidence-gated change |
 | valorant | Weakest model | [x] deep backfill DONE via exp-3 enrichment (5.6k->17.4k matches, to 2021). NEW follow-ups: [ ] retune valorant k/calibration on the deep store (Elo val Brier already 0.2325->0.2256 untuned) — next-week's change candidate; [ ] ship enriched stores to the server (its own fetch can never deep-backfill: early-stop) or run enrichment there |
 | LoL | Team-Elo live; player-Elo benched on stale data | [ ] auto: 2026 OE CSV lands → sidecar rebuilds → player-Elo reactivates; blend model activation is the XGB checklist below |
 | ITF | No data source, markets skipped | [ ] re-check for a free ITF source occasionally (low) |
@@ -46,19 +46,12 @@ to main without explicit approval.
 - [ ] **LoL blend ACTIVATION checklist**: (1) fresh 2026 OE data (auto-retrying),
       (2) rebuild sidecar + retrain, (3) CLV verdict positive, (4) explicit
       approval → merge + scp xgb_models/lol.* + sidecar
-- [ ] **Exp 3 (IN PROGRESS): esports context features** — bo_format + tier +
-      fatigue for dota2/cs2/valorant:
-      - [ ] store schema: fetcher keeps number_of_games + tournament tier per
-            match (tolerant readers; old rows -> NaN features per P6)
-      - [ ] resumable enrichment re-walk (~1.6k rate-limited requests; also
-            deepens valorant to full history as a side effect)
-      - [ ] fatigue features from the store itself
-      - [ ] inference wrinkle: upcoming-match bo_format via PandaScore
-            upcoming lookup (cached per cycle)
-      - [ ] train dota2/cs2/valorant on BASE + context; gate judges; ledger
-- [ ] **Phase 4 close-out** after exp 3: ship what cleared (with post-ship
-      weekly model-vs-Elo monitoring), write the final verdict for what
-      didn't, STOP on free data (remaining paths are paid-tier)
+- [x] Exp 3 esports context features — DEAD all three titles (dota2 +0.0006,
+      valorant val-rejected, cs2 +0.0006 on 68k rows); ledgered
+- [x] **Phase 4 close-out DONE (2026-07-13)**: LoL blend = sole winner
+      (awaiting activation gates); everything else ruled out on free data;
+      final verdict written in XGBOOST_PLAN.md. No further feature
+      experiments on current columns.
 
 ## Explicitly parked
 

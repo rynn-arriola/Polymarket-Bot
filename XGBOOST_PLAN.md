@@ -86,8 +86,24 @@ Any sport whose model clears `beats_elo` gets its file shipped; `xgb_live` activ
 automatically on the server. Everything else stays on Elo. Record what won and lost so
 we never re-run a dead end (extends the "XGBoost verdict" note).
 
-## Next concrete step
-Extend the esports store to capture `number_of_games` + `tournament.tier` per match
-(fetcher + schema-tolerant store change), one-time historical re-walk, then train
-dota2/cs2/valorant on BASE_FEATURES + [bo_format, tier, fatigue_a, fatigue_b] and let
-the gate judge. LoL additionally gets player-aggregate features from the OE data.
+## PROGRAM COMPLETE (2026-07-13) — final verdict
+
+Phase 3 ran to the end of the free data. Results:
+- Recency weighting: DEAD, all 10 sports (staleness already lives in elo_exp).
+- LoL player blend: **THE WINNER** — beats team Elo +0.0139 and player-Elo
+  +0.0044, ship-ready behind its activation gates (fresh 2026 OE data, retrain,
+  CLV verdict, explicit approval).
+- Esports context (bo/tier/fatigue): DEAD on dota2 (+0.0006), valorant
+  (val-rejected) and cs2 (+0.0006, 68k rows) — series-level results already
+  absorb Bo-variance into rating dynamics.
+
+CONCLUSION: on free data, Elo is the ceiling everywhere except where
+player-level data exists (LoL). The proven pattern — orthogonal PLAYER data
+beats team ratings — generalizes to dota2/cs2/valorant only via paid lineups
+(PandaScore stats plans, restricted for betting usage; see MODELS_TODO).
+Do not run further feature experiments on the current columns: the ledger
+says everything tried, and re-running dead ends is how noise gets shipped.
+
+Side profits of the program, banked for the LIVE models: valorant store
+5.6k->17.4k and cs2 52k->88.6k matches (retune candidates on MODELS_TODO),
+plus the dormancy patch that came out of the same non-stationarity research.
