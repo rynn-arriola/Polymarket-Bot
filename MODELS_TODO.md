@@ -65,5 +65,11 @@ to main without explicit approval.
 - Weekly drawdown circuit-breaker (beyond daily halt) — offered, not requested
 - Discord webhook retry on failed posts — cosmetic
 - phi-det permanent estimate line in audit — exchange quirk, harmless
-- Paid PandaScore tier (per-match lineups for dota2/cs2/valorant) — only if
-  exp 3 fails AND LoL blend proves live value
+- **Paid data (researched 2026-07-13, parked until CLV + scale justify):**
+  buy only when monthly profit > ~3x the subscription AND the purchase maps
+  to a proven model class. Ranked menu: (1) Goalserve Tennis ~$150/mo — the
+  one concrete unlock (ITF/Challenger model = new markets); (2) PandaScore
+  paid €150-400/mo PER GAME — kills rate limits, but stats/lineup plans are
+  RESTRICTED TO NON-BETTING USAGE (sales conversation required for us);
+  (3) Sportradar/Abios/GRID enterprise = the true "one API", $1k-5k+/mo,
+  not at this bankroll. Free first: Sackmann WTA/ITF CSV probe ($0).
