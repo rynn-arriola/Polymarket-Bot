@@ -107,6 +107,18 @@ def load_matrix(sport: str):
         games = soccer.fetch_games()
         X, y, dates = xf.extract_fwc(games)
         feats = xf.FWC_FEATURES
+    elif sport == "lol":
+        # The SHIPPING LoL model is the player blend (first gate clear,
+        # 2026-07-13) — trained on the OE per-game universe, the same state
+        # the sidecar serves at inference. (The old team-only baseline lives
+        # in the test-read ledger; retrain it via extract_esports if ever
+        # needed for comparison.)
+        from elo import lol_players
+        games = lol_players.load_oe_games("data/oe")
+        if not games:
+            raise SystemExit("no OE data in data/oe — run fetch_oe.py first")
+        X, y, dates = xf.extract_lol_players(games)
+        feats = xf.LOL_FEATURES
     elif sport in xgb_live.ESPORTS_TITLES:
         from elo import esports
         if OFFLINE:

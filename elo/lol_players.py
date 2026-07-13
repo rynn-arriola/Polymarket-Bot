@@ -229,21 +229,39 @@ def build_player_ratings(csv_dir: str = "data/oe", k: float = 48.0) -> tuple[dic
     return ratings, played, latest
 
 
-def build_live_model(csv_dir: str = "data/oe", k: float = 48.0) -> dict:
+def build_live_model(csv_dir: str = "data/oe", k: float = 48.0,
+                     team_k: float = 72.0) -> dict:
     """Full live LoL player model saved as a sidecar: player ratings +
     each team's MOST RECENT lineup (the live 'who plays' proxy, straight
     from OE — no Leaguepedia rate limits) + the latest data date (for the
-    freshness gate). Empty dict if no OE data present."""
+    freshness gate). Empty dict if no OE data present.
+
+    Also carries TEAM-Elo state computed over the SAME OE game stream
+    (team_elo/team_games): the gated LoL XGBoost blend was trained on
+    OE-games team features, and feeding it the live Leaguepedia match
+    engine instead would be train/serve drift — the sidecar is the single
+    OE-consistent state source for that model's whole feature row."""
     games = load_oe_games(csv_dir)
     if not games:
         return {}
     ratings, played, latest = build_player_ratings(csv_dir, k)
     team_lineups: dict[str, list[str]] = {}
+    team_elo: dict[str, float] = {}
+    team_games: dict[str, int] = {}
     for g in games:  # chronological, so the last write per team is its newest lineup
+        (t1, _p1), (t2, _p2) = sorted(g["teams"].items())
+        r1, r2 = team_elo.get(t1, DEFAULT_RATING), team_elo.get(t2, DEFAULT_RATING)
+        exp1 = 1.0 / (1.0 + 10 ** ((r2 - r1) / 400.0))
+        delta = team_k * ((1.0 if g["winner"] == t1 else 0.0) - exp1)
+        team_elo[t1] = r1 + delta
+        team_elo[t2] = r2 - delta
+        team_games[t1] = team_games.get(t1, 0) + 1
+        team_games[t2] = team_games.get(t2, 0) + 1
         for team, players in g["teams"].items():
             team_lineups[team] = players
     return {"ratings": ratings, "played": played, "team_lineups": team_lineups,
-            "latest_date": latest, "k": k}
+            "team_elo": team_elo, "team_games": team_games,
+            "latest_date": latest, "k": k, "team_k": team_k}
 
 
 def team_strength(ratings: dict, players: list[str]) -> float | None:

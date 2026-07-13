@@ -19,6 +19,7 @@ TENNIS_FEATURES = xgb_live.TENNIS_FEATURES
 BASE_FEATURES = xgb_live.BASE_FEATURES
 MLB_FEATURES = xgb_live.MLB_FEATURES
 FWC_FEATURES = xgb_live.FWC_FEATURES
+LOL_FEATURES = xgb_live.LOL_FEATURES
 
 
 def extract_nba(games: list[dict], league: str = "nba", season_regress: float = 1 / 3):
@@ -75,6 +76,46 @@ def extract_fwc(games: list[dict]):
                                  (xgb_live.fwc_features(e, h, a), d))
     return ([f for (f, _d), _ in preds], [y for _, y in preds],
             [d for (_f, d), _ in preds])
+
+
+def extract_lol_players(games: list[dict]):
+    """LoL blend (predicts P(alphabetically-first team wins)): dual
+    walk-forward — team Elo AND player ratings over the SAME OE game stream
+    — emitting the shared lol_features row strictly pre-game. Mirrors the
+    sidecar build (lol_players.build_live_model) update-for-update so the
+    state a live prediction reads is exactly what training saw."""
+    from elo import lol_players
+    team_k = 72.0    # matches params 'lol' k and the sidecar's team engine
+    player_k = 48.0  # backtest-winning player K (lol_players)
+    min_team_games = params.get("lol")["min_games"]
+    state = {"team_elo": {}, "team_games": {}, "ratings": {}, "played": {}}
+    te, tg, ratings, played = (state["team_elo"], state["team_games"],
+                               state["ratings"], state["played"])
+    X, y, dates = [], [], []
+    for g in games:
+        (t1, p1), (t2, p2) = sorted(g["teams"].items())
+        if tg.get(t1, 0) >= min_team_games and tg.get(t2, 0) >= min_team_games:
+            X.append(xgb_live.lol_features(state, t1, t2, p1, p2))
+            y.append(1 if g["winner"] == t1 else 0)
+            dates.append(g["date"])
+        actual1 = 1.0 if g["winner"] == t1 else 0.0
+        r1, r2 = te.get(t1, 1500.0), te.get(t2, 1500.0)
+        exp1 = 1.0 / (1.0 + 10 ** ((r2 - r1) / 400.0))
+        te[t1] = r1 + team_k * (actual1 - exp1)
+        te[t2] = r2 - team_k * (actual1 - exp1)
+        tg[t1] = tg.get(t1, 0) + 1
+        tg[t2] = tg.get(t2, 0) + 1
+        pr1 = sum(ratings.get(x, 1500.0) for x in p1) / len(p1)
+        pr2 = sum(ratings.get(x, 1500.0) for x in p2) / len(p2)
+        pexp1 = 1.0 / (1.0 + 10 ** ((pr2 - pr1) / 400.0))
+        pdelta = player_k * (actual1 - pexp1)
+        for x in p1:
+            ratings[x] = ratings.get(x, 1500.0) + pdelta
+            played[x] = played.get(x, 0) + 1
+        for x in p2:
+            ratings[x] = ratings.get(x, 1500.0) - pdelta
+            played[x] = played.get(x, 0) + 1
+    return X, y, dates
 
 
 def extract_esports(matches: list[tuple[str, str, str]], title: str):

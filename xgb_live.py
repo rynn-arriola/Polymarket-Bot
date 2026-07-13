@@ -61,6 +61,14 @@ MLB_FEATURES = ["elo_exp", "team_gap", "pitcher_gap",
 FWC_FEATURES = ["elo_exp", "elo_gap", "rating_home", "rating_away",
                 "games_home", "games_away"]
 
+# LoL: the gated player-blend (first gate clear, 2026-07-13 — beat player-Elo
+# +0.0044 and team-Elo +0.0139 on test). ALL features come from OE-consistent
+# state (the lol_player_model.json sidecar), never the live Leaguepedia match
+# engine — mixing the two would be train/serve drift. Player aggregates are
+# NaN when a lineup has <3 rated players (P6: NaN, never 0).
+LOL_FEATURES = ["elo_exp", "elo_gap", "rating_a", "rating_b", "games_a", "games_b",
+                "p_exp", "p_gap", "p_min_gap", "p_spread_diff", "p_experience_diff"]
+
 # Esports (and any future title-based sport) use the universal base vector —
 # no orthogonal data yet, so this is the honest Elo-only baseline until
 # per-match lineups / series-format / tier features land (see XGBOOST_PLAN.md).
@@ -69,7 +77,8 @@ ESPORTS_TITLES = ("dota2", "cs2", "lol", "valorant")
 FEATURES_FOR = {"nba": NBA_FEATURES, "wnba": NBA_FEATURES,
                 "atp": TENNIS_FEATURES, "wta": TENNIS_FEATURES,
                 "mlb": MLB_FEATURES, "fwc": FWC_FEATURES,
-                **{t: BASE_FEATURES for t in ESPORTS_TITLES}}
+                **{t: BASE_FEATURES for t in ESPORTS_TITLES},
+                "lol": LOL_FEATURES}
 
 
 # ------------------------------------------------------------------
@@ -147,6 +156,82 @@ def fwc_features(engine, home: str, away: str) -> dict:
     }
 
 
+LOL_MIN_KNOWN = 3  # <3 rated players per lineup -> player aggregates are NaN
+
+
+def lol_features(state: dict, t1: str, t2: str,
+                 lineup1: list[str], lineup2: list[str]) -> dict:
+    """LoL blend feature row for the ALPHABETICALLY-FIRST team t1 vs t2, from
+    OE-consistent state: {'team_elo': {}, 'team_games': {}, 'ratings': {},
+    'played': {}}. Shared by the walk-forward extractor (evolving state) and
+    live inference (the sidecar's final state) — identical either way."""
+    import math
+    nan = float("nan")
+    te, tg = state.get("team_elo", {}), state.get("team_games", {})
+    ratings, played = state.get("ratings", {}), state.get("played", {})
+    r1, r2 = te.get(t1, 1500.0), te.get(t2, 1500.0)
+    row = {
+        "elo_exp": 1.0 / (1.0 + 10 ** (-(r1 - r2) / 400.0)),
+        "elo_gap": r1 - r2,
+        "rating_a": r1, "rating_b": r2,
+        "games_a": tg.get(t1, 0), "games_b": tg.get(t2, 0),
+        "p_exp": nan, "p_gap": nan, "p_min_gap": nan,
+        "p_spread_diff": nan, "p_experience_diff": nan,
+    }
+    k1 = [ratings[x] for x in lineup1 if x in ratings]
+    k2 = [ratings[x] for x in lineup2 if x in ratings]
+    if len(k1) >= LOL_MIN_KNOWN and len(k2) >= LOL_MIN_KNOWN:
+        m1, m2 = sum(k1) / len(k1), sum(k2) / len(k2)
+        sd = lambda v, m: math.sqrt(sum((x - m) ** 2 for x in v) / len(v))
+        row["p_exp"] = 1.0 / (1.0 + 10 ** (-(m1 - m2) / 400.0))
+        row["p_gap"] = m1 - m2
+        row["p_min_gap"] = min(k1) - min(k2)
+        row["p_spread_diff"] = sd(k1, m1) - sd(k2, m2)
+        e1 = sum(played.get(x, 0) for x in lineup1) / len(lineup1)
+        e2 = sum(played.get(x, 0) for x in lineup2) / len(lineup2)
+        row["p_experience_diff"] = e1 - e2
+    return row
+
+
+_LOL_SIDECAR: dict | None = None
+_LOL_SIDECAR_LOADED = False
+
+
+def reset_lol_sidecar():
+    """Re-read lol_player_model.json on next use (ratings hot-reload path)."""
+    global _LOL_SIDECAR, _LOL_SIDECAR_LOADED
+    _LOL_SIDECAR, _LOL_SIDECAR_LOADED = None, False
+
+
+def _lol_sidecar() -> dict | None:
+    """The OE sidecar, freshness-gated exactly like the live player-Elo path
+    (config.LOL_PLAYER_FRESHNESS_DAYS): stale lineups/state -> None -> the
+    caller falls back to Elo. Requires the team_elo extension (older sidecar
+    files without it are unusable for the blend)."""
+    global _LOL_SIDECAR, _LOL_SIDECAR_LOADED
+    if _LOL_SIDECAR_LOADED:
+        return _LOL_SIDECAR
+    _LOL_SIDECAR_LOADED = True
+    try:
+        with open("lol_player_model.json") as f:
+            model = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    if not model.get("team_elo"):
+        log.info("LoL sidecar predates the team_elo extension — rebuild via "
+                 "build_ratings before the XGB blend can run; Elo stays live")
+        return None
+    try:
+        latest = datetime.fromisoformat(model.get("latest_date", "2000-01-01"))
+        age_days = (datetime.now() - latest).days
+    except ValueError:
+        return None
+    if age_days > getattr(config, "LOL_PLAYER_FRESHNESS_DAYS", 45):
+        return None  # stale lineups — the player-Elo path logs this already
+    _LOL_SIDECAR = model
+    return model
+
+
 def basketball_features(engine, league: str, home: str, away: str, game_date: str) -> dict:
     from elo import basketball, params
     p = params.get(league)
@@ -194,8 +279,10 @@ _CACHE: dict[str, dict | None] = {}
 
 def reset_cache():
     """Drop cached models so a freshly-trained/dropped-in model is picked up
-    on the next use (call from the ratings hot-reload)."""
+    on the next use (call from the ratings hot-reload). Also re-reads the LoL
+    sidecar — the refresh rebuilds it on the same cadence."""
     _CACHE.clear()
+    reset_lol_sidecar()
 
 
 def load_model(sport: str):
@@ -277,6 +364,23 @@ def predict(sport: str, engine, name_a: str, name_b: str, ctx: dict) -> float | 
         a, b = sorted((name_a, name_b))
         feats = tennis_features(engine, sport, a, b, ctx.get("surface"))
         flip = a != name_a  # model gives P(alphabetical-first); flip to name_a
+    elif sport == "lol":
+        # The blend's ENTIRE feature row comes from the OE sidecar (the live
+        # Leaguepedia engine is a different rating space — never mix). The
+        # caller's names are Leaguepedia-resolved, so re-resolve against the
+        # sidecar's own team universe; any gap -> None -> Elo fallback.
+        import name_match
+        sc = _lol_sidecar()
+        if not sc:
+            return None
+        lineups = sc["team_lineups"]
+        ra = name_match.resolve(name_a, lineups.keys())
+        rb = name_match.resolve(name_b, lineups.keys())
+        if not ra or not rb or ra == rb:
+            return None
+        a, b = sorted((ra, rb))
+        feats = lol_features(sc, a, b, lineups[a], lineups[b])
+        flip = a != ra  # model gives P(alphabetical-first); flip to name_a's team
     elif sport in ESPORTS_TITLES:
         a, b = sorted((name_a, name_b))
         feats = base_features(engine, a, b)
