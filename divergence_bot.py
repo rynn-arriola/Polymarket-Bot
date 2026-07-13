@@ -1094,13 +1094,62 @@ def capture_closing_lines(pub):
 _STUCK_SETTLEMENT_WARNED: dict = {}  # pid -> monotonic time of last "stuck" warning
 
 
-def check_settlements(client):
+def _resolution_pnl(auth, slug: str) -> float | None:
+    """Real fee-inclusive P&L from the account's POSITION_RESOLUTION activity
+    for this market, or None if the exchange hasn't resolved it (or the feed
+    is unavailable — callers fall back to the public settlement endpoint).
+    This is the same feed the app's History tab shows, and it publishes well
+    BEFORE the public /markets/{slug}/settlement record — polling only the
+    latter made Discord settlement messages lag by hours (reported
+    2026-07-13)."""
+    try:
+        resp = auth.portfolio.activities({
+            "marketSlug": slug,
+            "types": ["ACTIVITY_TYPE_POSITION_RESOLUTION"],
+            "limit": 1,
+        })
+    except Exception as e:
+        log.warning(f"Resolution-activity check failed for {slug}: {e}")
+        return None
+    activities = resp.get("activities") if isinstance(resp, dict) else None
+    if not activities:
+        return None
+    before = (activities[0].get("positionResolution") or {}).get("beforePosition") or {}
+    try:
+        cost = float((before.get("cost") or {}).get("value"))
+        cash_value = float((before.get("cashValue") or {}).get("value"))
+    except (TypeError, ValueError):
+        log.warning(f"Unrecognized resolution activity format for {slug}")
+        return None
+    return round(cash_value - cost, 2)
+
+
+def check_settlements(client, auth=None):
     rows = db(
-        "SELECT id, market_slug, price, quantity, is_long, created_at FROM positions WHERE status='open'",
+        "SELECT id, market_slug, price, quantity, is_long, created_at, live "
+        "FROM positions WHERE status='open'",
         fetch=True,
     )
     settled_ids = []
-    for pid, slug, price, quantity, is_long, created_at in rows:
+    for pid, slug, price, quantity, is_long, created_at, live in rows:
+        # FAST PATH (live positions): the account's own resolution activity —
+        # available as soon as the exchange resolves the position (what the
+        # History tab shows), and it carries the REAL fee-inclusive P&L, so
+        # the settlement message posts the true figure immediately instead of
+        # an estimate that reconcile_live_pnl corrects later.
+        if live and auth is not None:
+            pnl = _resolution_pnl(auth, slug)
+            if pnl is not None:
+                status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
+                db("UPDATE positions SET status=?, pnl=?, settled_at=?, pnl_reconciled=1 WHERE id=?",
+                   (status, pnl, datetime.now(timezone.utc).isoformat(), pid))
+                settled_ids.append(pid)
+                _STUCK_SETTLEMENT_WARNED.pop(pid, None)
+                log.info(f"SETTLED {status.upper()} {slug} (via resolution activity)  P&L {pnl:+.2f}")
+                continue
+        # SLOW PATH: the public settlement record — the only option for
+        # dry-run positions, and the fallback when the activity feed is
+        # quiet or unavailable.
         try:
             settlement = client.markets.settlement(slug)
         except Exception as e:
@@ -1301,7 +1350,7 @@ def cmd_run():
             confirm_fills(auth)
             capture_closing_lines(pub)
             cancel_stale_orders(auth)
-            settled_ids = check_settlements(pub)
+            settled_ids = check_settlements(pub, auth if config.LIVE else None)
             if config.LIVE:
                 reconcile_live_pnl(auth)
             if settled_ids:
