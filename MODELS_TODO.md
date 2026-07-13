@@ -30,7 +30,7 @@ to main without explicit approval.
 | FWC | World Cup ends 2026-07-19 | [ ] post-final: sport goes dormant — nothing to do, volume just stops |
 | dota2 | Deep PandaScore + dormancy patch | [ ] deploy confirmation (above); then — watch CLV |
 | cs2 | Deep PandaScore + first roster guard | [ ] same |
-| valorant | Weakest model | [ ] **deep backfill never ran** — the incremental early-stop fired because its store was never cleared (unlike dota2/cs2): still ~5.6k matches vs ~18k available to 2021. Fixed by the exp-3 enrichment re-walk (below) |
+| valorant | Weakest model | [x] deep backfill DONE via exp-3 enrichment (5.6k->17.4k matches, to 2021). NEW follow-ups: [ ] retune valorant k/calibration on the deep store (Elo val Brier already 0.2325->0.2256 untuned) — next-week's change candidate; [ ] ship enriched stores to the server (its own fetch can never deep-backfill: early-stop) or run enrichment there |
 | LoL | Team-Elo live; player-Elo benched on stale data | [ ] auto: 2026 OE CSV lands → sidecar rebuilds → player-Elo reactivates; blend model activation is the XGB checklist below |
 | ITF | No data source, markets skipped | [ ] re-check for a free ITF source occasionally (low) |
 
