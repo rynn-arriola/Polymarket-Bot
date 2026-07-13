@@ -114,13 +114,13 @@ positions table already) — so decay is observed, not assumed.
 | date | experiment | sport(s) | test Brier (XGB vs Elo) | verdict |
 |------|-----------|----------|--------------------------|---------|
 | 2026-07-13 | Elo-only baseline (Phase 2) | all 10 | ties everywhere (±0.0011) | anchor set |
+| 2026-07-13 | Recency weighting (exp 1) | 7 test reads (mlb/nba/fwc: val picked None, no read) | best median delta +0.0008 (lol), worst −0.0019 (valorant) | **DEAD — no gate clears.** Val Briers for None vs 730d were rounding-level ties on the deep-history sports: old data isn't hurting XGB, because elo_exp already carries Elo's sequential recency. Do not re-run on these features. |
 
 ## Priority order for Phase 3 (updated by this research)
 
-1. **Recency weighting** (P4) — cheapest, applies everywhere, no new data, no
-   store changes. Run FIRST: it may lift several sports at once and it changes
-   the baseline the other experiments must beat.
-2. **LoL player-aggregate features** — proven-orthogonal signal, data local.
+1. ~~**Recency weighting**~~ — RUN 2026-07-13, DEAD (see ledger). The negative
+   result is itself informative: staleness is already priced into elo_exp, so
+   non-stationarity is not where XGB's headroom is.
+2. **LoL player-aggregate features** — proven-orthogonal signal, data local. NOW NEXT.
 3. **Esports context features** (bo_format/tier/fatigue) — needs store extension
-   + historical re-walk; do after 1-2 so the re-walk effort is spent against the
-   strongest baseline.
+   + historical re-walk.
