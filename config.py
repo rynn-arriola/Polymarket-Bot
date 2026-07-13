@@ -252,7 +252,7 @@ SETTLEMENT_STUCK_WARNING_DAYS = 14
 # channel + webhook to keep this bot's reporting separate. Keep URLs
 # private: anyone with one can post into that channel.
 DISCORD_WEBHOOK_URL = _secret("DISCORD_WEBHOOK_URL")
-DISCORD_STATUS_INTERVAL_MIN = 30
+DISCORD_STATUS_INTERVAL_MIN = 5
 
 # Optional: a second webhook for one polished message per settled position
 # (includes what the model believed vs what the market charged at entry).

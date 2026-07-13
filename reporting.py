@@ -199,6 +199,50 @@ def stats_by_divergence() -> list[dict]:
     return out
 
 
+# Entry-price bands: is each segment beating its own break-even? A position
+# bought at price p breaks even at a win rate of p (plus ~1.2% fees) — so a
+# "low win rate" band is fine as long as its actual WR exceeds the average
+# price paid there. Bands are coarse on purpose: settled counts per band are
+# small for a long time, and narrow bands would just show noise.
+PRICE_BUCKETS = [(0.05, 0.15), (0.15, 0.30), (0.30, 0.50),
+                 (0.50, 0.70), (0.70, 0.85), (0.85, 0.95)]
+FEE_PCT = 0.012  # worst-case taker fee, same figure the thresholds assume
+
+
+def stats_by_price() -> list[dict]:
+    """Settled results grouped by ENTRY PRICE. Answers 'are the longshot
+    (low win rate) trades actually earning?': a band is healthy when its
+    actual win rate beats avg entry price + fees (its break-even), unhealthy
+    when it doesn't — regardless of how low the raw win rate looks."""
+    live = 1 if config.LIVE else 0
+    out = []
+    for lo, hi in PRICE_BUCKETS:
+        settled, won, lost, pnl, avg_price = db(
+            """SELECT COUNT(*),
+                       SUM(CASE WHEN status='won' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END),
+                       COALESCE(SUM(pnl), 0),
+                       AVG(price)
+                FROM positions
+                WHERE price >= ? AND price < ?
+                  AND status IN ('won','lost','push') AND live = ?""",
+            (lo, hi, live), fetch=True,
+        )[0]
+        won, lost = won or 0, lost or 0
+        breakeven = (avg_price + FEE_PCT) if avg_price is not None else None
+        wr = won / (won + lost) if (won + lost) else None
+        out.append({
+            "bucket": f"{lo:.0%}-{hi:.0%}",
+            "settled": settled or 0, "won": won, "lost": lost,
+            "pnl": pnl or 0.0,
+            "win_rate": wr,                    # fraction or None
+            "breakeven": breakeven,            # avg price + fees, or None
+            "beats": (None if wr is None or breakeven is None
+                      else wr > breakeven),
+        })
+    return out
+
+
 def summary_snapshot() -> dict:
     return {
         "today": stats_for_period("today"),
@@ -800,6 +844,30 @@ def post_discord_clv(reason: str = "CLV update") -> bool:
         fields.append({
             "name": "CLV by divergence size (bigger gap should beat the close more)",
             "value": "```ansi\n" + "\n".join(bl) + "\n```",
+            "inline": False,
+        })
+
+    # Win rate vs break-even by ENTRY PRICE band — "is the low-win-rate
+    # segment actually earning?" A band is green when actual WR beats its
+    # avg price + fees, red when it doesn't. n stays small for a while;
+    # bands without settled results show as gray placeholders.
+    price_rows = stats_by_price()
+    if any(r["settled"] for r in price_rows):
+        pl = [f"{'price':<9}{'record':<9}{'WR':>6}{'brkev':>7}{'P&L':>9}"]
+        for r in price_rows:
+            if r["win_rate"] is None:
+                if r["settled"]:  # pushes only
+                    continue
+                pl.append(f"⚪ {r['bucket']:<7}{'--':<9}{'--':>6}{'--':>7}{'--':>9}")
+                continue
+            code = "32" if r["beats"] else "31"
+            mark = pnl_emoji(1 if r["beats"] else -1)
+            rec = f"{r['won']}W-{r['lost']}L"
+            pl.append(f"\x1b[{code}m{mark} {r['bucket']:<7}{rec:<9}{r['win_rate']:>6.0%}"
+                      f"{r['breakeven']:>7.0%}{r['pnl']:>+9.2f}\x1b[0m")
+        fields.append({
+            "name": "Win rate vs break-even, by entry price (WR must beat brkev = avg price + fees)",
+            "value": "```ansi\n" + "\n".join(pl) + "\n```",
             "inline": False,
         })
 
