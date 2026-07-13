@@ -1131,14 +1131,21 @@ def capture_closing_lines(pub):
 _STUCK_SETTLEMENT_WARNED: dict = {}  # pid -> monotonic time of last "stuck" warning
 
 
-def _resolution_pnl(auth, slug: str) -> float | None:
-    """Real fee-inclusive P&L from the account's POSITION_RESOLUTION activity
-    for this market, or None if the exchange hasn't resolved it (or the feed
-    is unavailable — callers fall back to the public settlement endpoint).
-    This is the same feed the app's History tab shows, and it publishes well
-    BEFORE the public /markets/{slug}/settlement record — polling only the
-    latter made Discord settlement messages lag by hours (reported
-    2026-07-13)."""
+def _resolution_pnl(auth, slug: str) -> tuple[float, bool] | None:
+    """(P&L, stable) from the account's POSITION_RESOLUTION activity for this
+    market, or None if the exchange hasn't resolved it (or the feed is
+    unavailable — callers fall back to the public settlement endpoint).
+
+    `stable` is False while the activity is younger than
+    RESOLUTION_STABLE_MINUTES: the exchange RESTATES the cost basis (rolls
+    fees in) shortly after posting the resolution — 16 positions audited on
+    2026-07-13 carried P&L read too early, overstating the book ~$10.6.
+    Callers may act on an unstable figure (it's close, and Discord shouldn't
+    wait) but must not mark it final (pnl_reconciled) until stable.
+
+    This feed is the same one the app's History tab shows, and it publishes
+    well BEFORE the public /markets/{slug}/settlement record — polling only
+    the latter made settlement messages lag by hours (reported 2026-07-13)."""
     try:
         resp = auth.portfolio.activities({
             "marketSlug": slug,
@@ -1151,14 +1158,26 @@ def _resolution_pnl(auth, slug: str) -> float | None:
     activities = resp.get("activities") if isinstance(resp, dict) else None
     if not activities:
         return None
-    before = (activities[0].get("positionResolution") or {}).get("beforePosition") or {}
+    pr = activities[0].get("positionResolution") or {}
+    before = pr.get("beforePosition") or {}
     try:
         cost = float((before.get("cost") or {}).get("value"))
         cash_value = float((before.get("cashValue") or {}).get("value"))
     except (TypeError, ValueError):
         log.warning(f"Unrecognized resolution activity format for {slug}")
         return None
-    return round(cash_value - cost, 2)
+    stable = True  # unknown age -> assume stable (pre-updateTime API shapes)
+    raw_ts = pr.get("updateTime") or activities[0].get("updateTime")
+    if raw_ts:
+        try:
+            ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+            stable = age_min >= getattr(config, "RESOLUTION_STABLE_MINUTES", 45)
+        except (ValueError, TypeError):
+            pass
+    return round(cash_value - cost, 2), stable
 
 
 def check_settlements(client, auth=None):
@@ -1175,14 +1194,19 @@ def check_settlements(client, auth=None):
         # the settlement message posts the true figure immediately instead of
         # an estimate that reconcile_live_pnl corrects later.
         if live and auth is not None:
-            pnl = _resolution_pnl(auth, slug)
-            if pnl is not None:
+            res = _resolution_pnl(auth, slug)
+            if res is not None:
+                pnl, stable = res
                 status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
-                db("UPDATE positions SET status=?, pnl=?, settled_at=?, pnl_reconciled=1 WHERE id=?",
-                   (status, pnl, datetime.now(timezone.utc).isoformat(), pid))
+                # Settle NOW (Discord shouldn't wait), but only stamp the P&L
+                # final once the activity is old enough for the exchange's
+                # fee restatement — else reconcile_live_pnl refreshes it.
+                db("UPDATE positions SET status=?, pnl=?, settled_at=?, pnl_reconciled=? WHERE id=?",
+                   (status, pnl, datetime.now(timezone.utc).isoformat(), 1 if stable else 0, pid))
                 settled_ids.append(pid)
                 _STUCK_SETTLEMENT_WARNED.pop(pid, None)
-                log.info(f"SETTLED {status.upper()} {slug} (via resolution activity)  P&L {pnl:+.2f}")
+                log.info(f"SETTLED {status.upper()} {slug} (via resolution activity)  P&L {pnl:+.2f}"
+                         + ("" if stable else "  (provisional — final figure reconciles shortly)"))
                 continue
         # SLOW PATH: the public settlement record — the only option for
         # dry-run positions, and the fallback when the activity feed is
@@ -1253,27 +1277,18 @@ def reconcile_live_pnl(client):
         fetch=True,
     )
     for pid, slug in rows:
-        try:
-            resp = client.portfolio.activities({
-                "marketSlug": slug,
-                "types": ["ACTIVITY_TYPE_POSITION_RESOLUTION"],
-                "limit": 1,
-            })
-        except Exception as e:
-            log.warning(f"Could not fetch resolution activity for {slug}: {e}")
+        res = _resolution_pnl(client, slug)
+        if res is None:
+            continue  # not posted yet / feed unavailable — retry next cycle
+        real_pnl, stable = res
+        if not stable:
+            # The exchange restates cost basis (fees) shortly after posting
+            # the resolution; a figure read too early sticks WRONG forever
+            # (16 drifted rows, 2026-07-13 audit). Wait for it to settle.
             continue
-        activities = resp.get("activities") if isinstance(resp, dict) else None
-        if not activities:
-            continue  # exchange hasn't posted the resolution yet — retry next cycle
-        before = (activities[0].get("positionResolution") or {}).get("beforePosition") or {}
-        try:
-            cost = float((before.get("cost") or {}).get("value"))
-            cash_value = float((before.get("cashValue") or {}).get("value"))
-        except (TypeError, ValueError):
-            log.warning(f"Unrecognized resolution activity format for {slug}")
-            continue
-        real_pnl = round(cash_value - cost, 2)
-        db("UPDATE positions SET pnl=?, pnl_reconciled=1 WHERE id=?", (real_pnl, pid))
+        status = "won" if real_pnl > 0 else ("lost" if real_pnl < 0 else "push")
+        db("UPDATE positions SET pnl=?, status=?, pnl_reconciled=1 WHERE id=?",
+           (real_pnl, status, pid))
         log.info(f"Reconciled {slug}: actual P&L {real_pnl:+.2f} (fees included)")
 
 

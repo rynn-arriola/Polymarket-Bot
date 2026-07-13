@@ -94,7 +94,15 @@ except Exception as e:
     print(f"  exchange unavailable ({e}) — DB-only audit")
     activities = []
 
+# The account also carries the OLD band-filter bot's history: resolutions
+# from before THIS bot's first live entry are expected to have no DB row
+# and are not flagged (verified 2026-07-13: all such flags were July 1-2
+# positions from the prior bot).
+cutoff = q("SELECT MIN(created_at) FROM positions WHERE live=1")
+cutoff = (cutoff[0][0] if cutoff and cutoff[0][0] else "9999")
+
 mismatched = []
+skipped_precutoff = 0
 for a in activities:
     pr = a.get("positionResolution") or {}
     slug = pr.get("marketSlug") or "?"
@@ -105,6 +113,10 @@ for a in activities:
         ex_pnl = None
     row = q("SELECT status, pnl FROM positions WHERE market_slug=?", slug)
     if not row:
+        upd = str(pr.get("updateTime") or a.get("updateTime") or "").replace("Z", "+00:00")
+        if upd and upd < cutoff:
+            skipped_precutoff += 1
+            continue  # pre-dates this bot's live history — the other bot's position
         flag(f"{slug}: resolved on exchange, NO DB ROW (untracked position!)")
         continue
     status, db_pnl = row[0]
@@ -113,6 +125,8 @@ for a in activities:
     elif ex_pnl is not None and db_pnl is not None and abs(ex_pnl - db_pnl) > 0.02:
         flag(f"{slug}: pnl drift DB={db_pnl} vs exchange={ex_pnl}")
         mismatched.append(slug)
+if skipped_precutoff:
+    print(f"  ({skipped_precutoff} pre-cutover resolutions skipped — other bot's history)")
 if activities and not FLAGS:
     print("  all resolutions matched — good")
 
