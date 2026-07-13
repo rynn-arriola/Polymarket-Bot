@@ -581,18 +581,51 @@ def capture_dota_rosters():
              f"({len(store) - len(rosters)} still unrostered)")
 
 
+def _apply_inactivity_decay(engine: EloEngine, team: str, game_day, last_played: dict, p: dict):
+    """One-shot regression toward the mean when a team RETURNS after a long
+    idle spell. An Elo rating is earned by a specific roster in a specific
+    meta; after months dormant both have usually changed, and the stale
+    rating shows up live as a fat fake divergence the market (which knows)
+    happily takes the other side of. Measured 2026-07-13 on dormant-team
+    games (90d idle): dota2 Brier 0.2257->0.2213, cs2 0.2288->0.2222.
+    No-op for titles without inactivity params (lol, valorant — no measured
+    benefit there)."""
+    days = p.get("inactivity_days")
+    frac = p.get("inactivity_regress", 0.0)
+    if not days or not frac:
+        return
+    prev = last_played.get(team)
+    if prev is not None and (game_day - prev).days > days and team in engine.ratings:
+        engine.ratings[team] += (1500.0 - engine.ratings[team]) * frac
+
+
 def replay(matches: list, p: dict, collect: bool = False) -> tuple[EloEngine, list]:
     """Chronological replay, same walk-forward contract as every other
     adapter. Alphabetical player-A ordering for collected predictions —
-    outcome-independent, so calibration buckets stay honest."""
+    outcome-independent, so calibration buckets stay honest. Tracks each
+    team's last-played date (engine.extras — the live dormancy check needs
+    it) and applies the on-return inactivity decay before predicting."""
+    from datetime import date as _date
     engine = EloEngine(k_factor=p["k"])
+    last_played: dict = {}
     predictions = []
-    for _d, winner, loser in matches:
+    for d, winner, loser in matches:
+        try:
+            game_day = _date.fromisoformat(str(d)[:10])
+        except ValueError:
+            game_day = None
+        if game_day is not None:
+            _apply_inactivity_decay(engine, winner, game_day, last_played, p)
+            _apply_inactivity_decay(engine, loser, game_day, last_played, p)
         if collect and engine.games(winner) >= p["min_games"] and engine.games(loser) >= p["min_games"]:
             name_a, name_b = sorted((winner, loser))
             prob_a = engine.probability(name_a, name_b)
             predictions.append((prob_a, 1.0 if name_a == winner else 0.0))
         engine.record_result(winner, loser, 1.0)
+        if game_day is not None:
+            last_played[winner] = game_day
+            last_played[loser] = game_day
+    engine.extras["last_played"] = {t: d.isoformat() for t, d in last_played.items()}
     return engine, predictions
 
 
@@ -602,8 +635,31 @@ def build_engine(title: str) -> tuple[EloEngine, int]:
     return engine, len(matches)
 
 
+def _effective_rating(engine: EloEngine, team: str, p: dict) -> float:
+    """Rating for a LIVE prediction: if the team is dormant right now
+    (idle past inactivity_days as of today), view its rating through the
+    same one-shot regression the replay applies on return — WITHOUT
+    mutating stored state, so the check is idempotent across cycles and
+    the replay's own on-return decay stays the single source of truth
+    once the team actually plays."""
+    from datetime import date as _date
+    r = engine.get_rating(team)
+    days = p.get("inactivity_days")
+    frac = p.get("inactivity_regress", 0.0)
+    lp = (engine.extras.get("last_played") or {}).get(team)
+    if days and frac and lp:
+        try:
+            idle = (_date.today() - _date.fromisoformat(str(lp)[:10])).days
+        except ValueError:
+            return r
+        if idle > days:
+            r += (1500.0 - r) * frac
+    return r
+
+
 def probability(engine: EloEngine, team_a: str, team_b: str, title: str) -> float | None:
     p = params.get(title)
     if engine.games(team_a) < p["min_games"] or engine.games(team_b) < p["min_games"]:
         return None
-    return engine.probability(team_a, team_b)
+    gap = _effective_rating(engine, team_a, p) - _effective_rating(engine, team_b, p)
+    return 1.0 / (1.0 + 10 ** (-gap / 400.0))
