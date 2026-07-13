@@ -115,6 +115,7 @@ positions table already) — so decay is observed, not assumed.
 |------|-----------|----------|--------------------------|---------|
 | 2026-07-13 | Elo-only baseline (Phase 2) | all 10 | ties everywhere (±0.0011) | anchor set |
 | 2026-07-13 | Recency weighting (exp 1) | 7 test reads (mlb/nba/fwc: val picked None, no read) | best median delta +0.0008 (lol), worst −0.0019 (valorant) | **DEAD — no gate clears.** Val Briers for None vs 730d were rounding-level ties on the deep-history sports: old data isn't hurting XGB, because elo_exp already carries Elo's sequential recency. Do not re-run on these features. |
+| 2026-07-13 | LoL player-aggregate features (exp 2) | lol (OE per-game universe, 25.9k rows, 1 test read, 5 seeds) | XGB 0.2220 (range .2217-.2223) vs team Elo 0.2359 (**+0.0139**) vs player Elo 0.2263 (**+0.0044**, n=3873) | **FIRST GATE CLEAR — beats team Elo 7x margin AND the player-Elo incumbent 2x margin, every seed positive.** Gain-importance confirms blending: p_gap/p_exp dominate, elo_exp/elo_gap second. NOT deployable as-is: training's team features come from an OE-games engine, live's from the Leaguepedia match engine (train/serve drift) — shipping needs the sidecar extended to carry OE-consistent team+player state, and inherits the OE freshness gate. Held for CLV verdict + explicit user approval per plan. |
 
 ## Priority order for Phase 3 (updated by this research)
 
