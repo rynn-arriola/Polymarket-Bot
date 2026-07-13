@@ -44,32 +44,50 @@ Explicitly OUT of scope (for now):
 
 ## Phases
 
-**Phase 0 — Confirm the premise (one probe, gates everything).**
-Does PandaScore expose per-match player lineups for dota2/cs2/valorant? (The probe was
-rate-limited on 2026-07-12; retry when quota resets.) YES → rank-1 path is real and
-becomes the flagship. NO → fall back to context features (ranks 2-4) + LoL-only player
-signal.
+**Phase 0 — Confirm the premise. ✅ ANSWERED 2026-07-13: NO lineups on the free plan.**
+Match payloads carry no player lists and the per-game detail endpoint returns HTTP 403
+(paid tier). → The player-Elo path (3a) is DEAD for dota2/cs2/valorant on free data;
+LoL keeps its player signal (Oracle's Elixir CSVs, independent of PandaScore).
+**BUT the same probe confirmed the rank-2/3 features ARE in payloads we already fetch:**
+`number_of_games` (Bo1/Bo3/Bo5) and `tournament.tier` sit in every /matches/past item.
+→ **Phase 3b is promoted to the flagship path.**
 
-**Phase 1 — Extend the harness to esports (pure infra, no risk).**
-`train_xgb.load_matrix` + `xgb_features` currently cover only nba/wnba/atp/wta. Add an
-esports extractor so esports models can even be trained/tested. Wire `xgb_live` feature
-lists for the esports titles.
+**Phase 1 — Extend the harness to all sports. ✅ DONE 2026-07-12/13.**
+BASE_FEATURES + esports/mlb/fwc extractors + `--offline` flag (esports train from the
+local store without stalling on rate-limited source refreshes).
 
-**Phase 2 — Control run on the deepened data.**
-dota2/cs2 now have 35k/52k matches. Re-run XGB on the CURRENT (Elo-only) features as the
-honest control. Expectation: still ties Elo. Cheap, and it anchors the comparison.
+**Phase 2 — Control run, all 10 sports. ✅ DONE 2026-07-13.** As predicted, XGBoost on
+Elo-only features ties Elo EVERYWHERE (every delta within ±0.0011 Brier, all under the
+0.002 activation margin, all models correctly inactive):
+
+| sport | Elo    | XGB    |   | sport    | Elo    | XGB    |
+|-------|--------|--------|---|----------|--------|--------|
+| nba   | 0.2095 | 0.2106 |   | dota2    | 0.2153 | 0.2148 |
+| wnba  | 0.2132 | 0.2128 |   | cs2      | 0.2193 | 0.2194 |
+| atp   | 0.2226 | 0.2221 |   | lol      | 0.2337 | 0.2340 |
+| wta   | 0.2196 | 0.2201 |   | valorant | 0.2432 | 0.2432 |
+| mlb   | 0.2469 | 0.2475 |   | fwc      | 0.2420 | 0.2459 |
+
+This is the anchor: a future feature earns activation only by dragging a sport's XGB
+Brier below Elo − 0.002 on the untouched test slice. Pipeline, gate, baseline: done.
 
 **Phase 3 — The real experiments (each judged by the gate).**
-- 3a. Player-aggregate features (mean/min/spread of lineup player ratings) alongside
-  team-Elo — the rank-1 bet, if Phase 0 says lineups exist.
-- 3b. Context features: Bo-format, tier, fatigue.
-- Test each addition independently so we learn WHICH signal (if any) carries edge.
+- **3b (flagship now): match-context features for esports.** Bo-format
+  (`number_of_games` — Bo1 variance vs Bo3/Bo5 skill expression is a real, Elo-blind
+  effect), tournament tier, and fatigue (matches in last N days — derivable from our
+  own store, no new data). COST: the store keeps only (date, winner, loser) today;
+  format/tier need a store-schema extension + one-time historical re-walk (~1.6k
+  requests, same resumable pattern as the 2026-07-12 deep backfill).
+- 3a (player-aggregate features): **LoL only** (Oracle's Elixir per-game lineups).
+  Blocked for other esports unless a paid tier or new free source appears.
 
 **Phase 4 — Decide and document.**
 Any sport whose model clears `beats_elo` gets its file shipped; `xgb_live` activates it
 automatically on the server. Everything else stays on Elo. Record what won and lost so
 we never re-run a dead end (extends the "XGBoost verdict" note).
 
-## First concrete step
-Retry the Phase-0 lineup probe once the PandaScore hourly quota clears (~1h from the
-2026-07-12 backfill). That single fact decides whether the flagship path exists.
+## Next concrete step
+Extend the esports store to capture `number_of_games` + `tournament.tier` per match
+(fetcher + schema-tolerant store change), one-time historical re-walk, then train
+dota2/cs2/valorant on BASE_FEATURES + [bo_format, tier, fatigue_a, fatigue_b] and let
+the gate judge. LoL additionally gets player-aggregate features from the OE data.

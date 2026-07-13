@@ -35,6 +35,12 @@ ORDER = {"nba": "home", "wnba": "home", "mlb": "home", "fwc": "home",
 
 TRAIN_FRAC, VAL_FRAC = 0.70, 0.15  # test = remaining 15%, most-recent games
 
+# --offline: train esports from the local accumulating store WITHOUT the
+# source refresh — Leaguepedia/PandaScore fetches (rate limits, flaky
+# mirrors) stalled a 7-sport batch for 15+ minutes on 2026-07-12. The
+# stores are already deep; training doesn't need today's matches.
+OFFLINE = "--offline" in sys.argv
+
 
 def brier(pred, actual) -> float:
     pred, actual = np.asarray(pred, float), np.asarray(actual, float)
@@ -101,6 +107,8 @@ def load_matrix(sport: str):
         feats = xf.FWC_FEATURES
     elif sport in xgb_live.ESPORTS_TITLES:
         from elo import esports
+        if OFFLINE:
+            esports._FETCHERS = {**esports._FETCHERS, sport: (lambda s, t=None: 0)}
         matches = esports.fetch_matches(sport)   # (date, winner, loser), from the local store
         X, y = xf.extract_esports(matches, sport)
         feats = xf.BASE_FEATURES
@@ -194,7 +202,7 @@ def main(sport: str):
 
 
 if __name__ == "__main__":
-    sports = [s.lower() for s in sys.argv[1:]] or ["nba"]
+    sports = [s.lower() for s in sys.argv[1:] if not s.startswith("--")] or ["nba"]
     for i, sp in enumerate(sports):
         if i:
             print("\n" + "#" * 60 + "\n")
