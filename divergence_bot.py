@@ -1185,6 +1185,71 @@ def cancel_stale_orders(client):
             log.info(f"Cancelled unfilled order on {slug} after {age_min:.0f} min")
 
 
+def verify_cancelled_rows(auth):
+    """Self-heal mis-cancelled rows: cross-check every live 'cancelled' row
+    against the exchange ONCE, and restore it if the exchange disagrees.
+
+    Both mis-cancel incidents (2026-07-13 pagination, 2026-07-14 read-path
+    lag) had the same shape: the DB said cancelled while the exchange held a
+    real position — settled losses invisible to reporting until repaired by
+    hand. The exchange is the source of truth, so verify against it:
+
+      - position still held        -> restore to 'open' (normal settlement
+                                      flow takes it from there)
+      - POSITION_RESOLUTION posted -> settle with the exchange's own
+                                      fee-inclusive P&L
+      - neither                    -> genuinely cancelled; flag verified so
+                                      the row is never checked again
+
+    Checks wait until the row is ORDER_VISIBILITY_GRACE_MIN old (same
+    read-path-lag reasoning as confirm_fills), and each row is verified at
+    most once, so the steady-state API cost is zero. Known blind spot: a
+    MANUAL position on the same market would make a correctly-cancelled bot
+    row look filled — acceptable; the loud ops log makes any heal visible.
+    """
+    if not config.LIVE:
+        return
+    rows = db(
+        "SELECT id, market_slug, price, quantity, created_at FROM positions "
+        "WHERE live=1 AND status='cancelled' AND COALESCE(cancel_verified,0)=0",
+        fetch=True,
+    )
+    grace = getattr(config, "ORDER_VISIBILITY_GRACE_MIN", 5)
+    for pid, slug, price, quantity, created_at in rows:
+        try:
+            age_min = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(created_at)).total_seconds() / 60
+        except (TypeError, ValueError):
+            age_min = None
+        if age_min is not None and age_min < grace:
+            continue  # too young for the exchange read path to be trustworthy
+        qty = _position_quantity(auth, slug)
+        if qty is None:
+            continue  # lookup failed — retry next cycle
+        if qty > 0:
+            _mark_open(pid, slug, price, quantity,
+                       min(_as_int(qty), _as_int(quantity)) or _as_int(quantity))
+            db("UPDATE positions SET cancel_verified=1 WHERE id=?", (pid,))
+            log.warning(f"MIS-CANCEL healed: {slug} was marked cancelled but the "
+                        f"exchange holds {qty:.0f} contract(s) — restored to open")
+            continue
+        res = _resolution_pnl(auth, slug)
+        if res is not None:
+            pnl, stable = res
+            status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
+            db("UPDATE positions SET status=?, pnl=?, settled_at=?, "
+               "pnl_reconciled=?, cancel_verified=1 WHERE id=?",
+               (status, pnl, datetime.now(timezone.utc).isoformat(),
+                1 if stable else 0, pid))
+            log.warning(f"MIS-CANCEL healed: {slug} was marked cancelled but "
+                        f"resolved on the exchange — settled {status.upper()} "
+                        f"P&L {pnl:+.2f}")
+            continue
+        # Exchange agrees: no position, no resolution — genuinely cancelled.
+        db("UPDATE positions SET cancel_verified=1 WHERE id=?", (pid,))
+    return
+
+
 def mark_rescheduled_positions(pub) -> int:
     """Mark LIVE open positions whose match the exchange has RESCHEDULED.
 
@@ -1687,6 +1752,7 @@ def cmd_run():
             capture_closing_lines(pub)
             capture_signal_closing_lines(pub)
             cancel_stale_orders(auth)
+            verify_cancelled_rows(auth)
             mark_rescheduled_positions(pub)
             settled_ids = check_settlements(pub, auth if config.LIVE else None)
             check_signal_settlements(pub)
