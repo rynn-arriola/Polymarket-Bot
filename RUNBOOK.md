@@ -131,6 +131,10 @@ working. New entries halt until midnight ET; open positions still settle.
 - P&L reconciliation to exchange-exact figures: within ~1h of each settlement
 - Ratings/data refresh: every 6h (hot-reload, no restart)
 - CLV capture: final minutes before every game start
+- Rescheduled matches: once a position is 2h past its original start AND the
+  exchange has moved the start into the future, it auto-exits at market
+  (long games are never touched — the trigger is the market's own new start
+  time, not elapsed time); you'll see a settlement card + a 🟡 alert
 - LoL 2026 data: retried every refresh until the Drive quota yields
 - Daily loss brake, roster/injury/dormancy guards, price/spread gates
 
