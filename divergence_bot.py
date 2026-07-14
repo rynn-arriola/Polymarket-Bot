@@ -1729,6 +1729,7 @@ def cmd_run():
     reporting.post_discord_summary("Bot started")
     reporting.post_discord_paper_summary("Bot started")
     reporting.post_discord_clv("Bot started")
+    reporting.post_discord_paper_clv("Bot started")
     last_discord_status = time.monotonic()
     last_clv_report = time.monotonic()
 
@@ -1776,6 +1777,7 @@ def cmd_run():
             per_day = getattr(config, "CLV_REPORT_TIMES_PER_DAY", 0)
             if per_day > 0 and time.monotonic() - last_clv_report >= 24 / per_day * 3600:
                 reporting.post_discord_clv("Scheduled CLV report")
+                reporting.post_discord_paper_clv("Scheduled CLV report")
                 last_clv_report = time.monotonic()
             reporting.maybe_post_daily_digest()
             reporting.maybe_post_ops_digest()
