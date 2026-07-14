@@ -20,12 +20,26 @@ import xgboost as xgb
 import config
 import xgb_features as xf
 import xgb_live
-from elo import basketball, params
+from elo import basketball, mlb, params, soccer
+
+# A model must beat Elo's test Brier by AT LEAST this much to be flagged
+# beats_elo (and so become live-eligible). Without a margin, a noise-level
+# 0.0005 "win" on Elo-only features trips the gate — verified live on dota2
+# 2026-07-12. This encodes "meaningfully better than Elo", not "not worse".
+BEAT_MARGIN = 0.002
 
 # Convention each sport's model predicts on (for xgb_live to map back).
-ORDER = {"nba": "home", "wnba": "home", "atp": "alpha", "wta": "alpha"}
+ORDER = {"nba": "home", "wnba": "home", "mlb": "home", "fwc": "home",
+         "atp": "alpha", "wta": "alpha",
+         "dota2": "alpha", "cs2": "alpha", "lol": "alpha", "valorant": "alpha"}
 
 TRAIN_FRAC, VAL_FRAC = 0.70, 0.15  # test = remaining 15%, most-recent games
+
+# --offline: train esports from the local accumulating store WITHOUT the
+# source refresh — Leaguepedia/PandaScore fetches (rate limits, flaky
+# mirrors) stalled a 7-sport batch for 15+ minutes on 2026-07-12. The
+# stores are already deep; training doesn't need today's matches.
+OFFLINE = "--offline" in sys.argv
 
 
 def brier(pred, actual) -> float:
@@ -71,22 +85,51 @@ def calibration_table(pred, actual, bins=10):
 
 
 def load_matrix(sport: str):
-    """Returns (feature_matrix, labels, feature_names) for a sport."""
+    """Returns (feature_matrix, labels, feature_names, dates) for a sport.
+    dates align 1:1 with rows (ISO strings) — the recency-weighting
+    experiments need each row's age; plain training ignores them."""
     if sport in ("nba", "wnba"):
         start = config.NBA_START_DATE if sport == "nba" else config.WNBA_START_DATE
         games = basketball.fetch_games(sport, start, date.today())
-        X, y = xf.extract_nba(games, sport)
+        X, y, dates = xf.extract_nba(games, sport)
         feats = xf.FEATURES
     elif sport in ("atp", "wta"):
         from elo import tennis
         matches = tennis.fetch_matches_for(sport, config.TENNIS_START_DATE, date.today(),
                                            config.TENNIS_TML_START_YEAR)
-        X, y = xf.extract_tennis(matches, sport)
+        X, y, dates = xf.extract_tennis(matches, sport)
         feats = xf.TENNIS_FEATURES
+    elif sport == "mlb":
+        games = mlb.fetch_games(config.MLB_START_YEAR)
+        X, y, dates = xf.extract_mlb(games)
+        feats = xf.MLB_FEATURES
+    elif sport == "fwc":
+        games = soccer.fetch_games()
+        X, y, dates = xf.extract_fwc(games)
+        feats = xf.FWC_FEATURES
+    elif sport == "lol":
+        # The SHIPPING LoL model is the player blend (first gate clear,
+        # 2026-07-13) — trained on the OE per-game universe, the same state
+        # the sidecar serves at inference. (The old team-only baseline lives
+        # in the test-read ledger; retrain it via extract_esports if ever
+        # needed for comparison.)
+        from elo import lol_players
+        games = lol_players.load_oe_games("data/oe")
+        if not games:
+            raise SystemExit("no OE data in data/oe — run fetch_oe.py first")
+        X, y, dates = xf.extract_lol_players(games)
+        feats = xf.LOL_FEATURES
+    elif sport in xgb_live.ESPORTS_TITLES:
+        from elo import esports
+        if OFFLINE:
+            esports._FETCHERS = {**esports._FETCHERS, sport: (lambda s, t=None: 0)}
+        matches = esports.fetch_matches(sport)   # (date, winner, loser), from the local store
+        X, y, dates = xf.extract_esports(matches, sport)
+        feats = xf.BASE_FEATURES
     else:
         raise SystemExit(f"no XGB feature extractor for {sport!r}")
     M = np.array([[row[c] for c in feats] for row in X], dtype=float)
-    return M, np.asarray(y, float), feats
+    return M, np.asarray(y, float), feats, dates
 
 
 def _save_model(sport, bst, best_it, feats, cal, order, elo_b, xgb_b):
@@ -100,7 +143,8 @@ def _save_model(sport, bst, best_it, feats, cal, order, elo_b, xgb_b):
         "calibration": {"a": round(cal[0], 4), "b": round(cal[1], 4)},
         "order": order,
         "best_iteration": int(best_it),
-        "beats_elo": bool(xgb_b < elo_b),
+        "beats_elo": bool(xgb_b < elo_b - BEAT_MARGIN),
+        "beat_margin": BEAT_MARGIN,
         "elo_brier": round(elo_b, 4),
         "xgb_brier": round(xgb_b, 4),
         "trained_at": datetime.now(timezone.utc).isoformat(),
@@ -111,7 +155,7 @@ def _save_model(sport, bst, best_it, feats, cal, order, elo_b, xgb_b):
 
 
 def main(sport: str):
-    M, y, feats = load_matrix(sport)
+    M, y, feats, _dates = load_matrix(sport)
     n = len(y)
     tr, va = int(n * TRAIN_FRAC), int(n * (TRAIN_FRAC + VAL_FRAC))
     Xtr, ytr = M[:tr], y[:tr]
@@ -153,8 +197,10 @@ def main(sport: str):
     print(f"  XGB   test Brier : {xgb_cal_b:.4f}   Platt-calibrated (a={a:.3f}, b={b:+.3f})")
     print("=" * 52)
     delta = elo_b - xgb_b
-    verdict = "XGB BEATS Elo" if delta > 0 else "Elo wins"
-    print(f"  -> {verdict} by {abs(delta):.4f} Brier ({'+' if delta>0 else '-'}{abs(delta)/elo_b:.1%})\n")
+    beats = xgb_b < elo_b - BEAT_MARGIN
+    verdict = (f"XGB BEATS Elo (>{BEAT_MARGIN} margin) — ACTIVATES" if beats
+               else "ties/loses Elo — stays inactive" if delta <= BEAT_MARGIN else "XGB edges Elo but under margin")
+    print(f"  -> {verdict}: delta {delta:+.4f} Brier ({delta/elo_b:+.1%})\n")
 
     print("XGB calibration on test:")
     print(calibration_table(cal_te if keep_cal else raw_te, yte))
@@ -170,7 +216,7 @@ def main(sport: str):
 
 
 if __name__ == "__main__":
-    sports = [s.lower() for s in sys.argv[1:]] or ["nba"]
+    sports = [s.lower() for s in sys.argv[1:] if not s.startswith("--")] or ["nba"]
     for i, sp in enumerate(sports):
         if i:
             print("\n" + "#" * 60 + "\n")

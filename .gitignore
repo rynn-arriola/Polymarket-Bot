@@ -17,3 +17,8 @@ __pycache__/
 
 # Data cache (regenerable via fetch_oe.py / refresh_data.py, 297MB+)
 data/
+
+# XGBoost artifacts: only the approved LoL activation model is tracked.
+xgb_models/*
+!xgb_models/lol.meta.json
+!xgb_models/lol.ubj
