@@ -10,7 +10,7 @@ structural weakness of team-level esports Elo (flagged throughout).
 
 What this does — a prospective guard, not a historical player model
 (free data can't support full historical player-Elo across titles; see
-README):
+OPERATOR.md):
 
   1. Snapshot each team's current roster the first time we see it.
   2. On each check, compare the live roster to the snapshot. If it has
