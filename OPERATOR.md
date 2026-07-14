@@ -30,9 +30,21 @@ a DigitalOcean droplet. Every change you make can lose money.
 
 ## 2. Non-negotiable rules
 
-1. **NEVER copy any `positions.db` TO the server.** The server's copy is the
-   live money record and it never self-heals. Downloading it is fine.
-   Uploading it, ever, for any reason, is not.
+1. **Data flows DOWN from the server, never up.** The server is the source of
+   truth for everything it generates:
+
+   ```
+   server  --->  local     ALWAYS   (python pull_server_state.py, daily)
+   local   --->  server    NEVER    (positions.db, elo_ratings.json,
+                                     elo_freshness.json, lol_player_model.json)
+   ```
+
+   **NEVER copy any `positions.db` TO the server.** The server's copy is the
+   live money record and it never self-heals. Overwriting it destroys real
+   trading history that exists nowhere else. Downloading it is not just fine,
+   it's the daily job — it's the only backup that isn't on the droplet.
+
+   Only *code* flows up (local → branch → main → scp). Data only comes down.
 2. **NEVER `scp -r` or `scp *` toward the server.** Always an explicit list of
    files.
 3. **Never scp generated data** (`elo_ratings.json`, `elo_freshness.json`,
@@ -173,7 +185,35 @@ fresher. `credentials.example.py` is expected to be absent on the server.
 
 ## 5. Operating cadence — what to run and when
 
-### DAILY — nothing to run, just glance at Discord (~1 min)
+### DAILY (~2 min)
+
+**1. Pull the server's state down.**
+```bash
+python pull_server_state.py    # local, from the repo
+```
+Pulls the server's live state **down** to `server_mirror/`: the live
+`positions.db` and the ratings files the server rebuilds every 6h. Two reasons
+this is a daily habit and not an occasional one:
+
+- **Local goes stale fast.** The server rebuilds ratings 4×/day. Analysis run
+  against local ratings that are two days old is analysis of a bot that doesn't
+  exist.
+- **`positions.db` exists in exactly ONE place: the droplet.** If it dies, the
+  entire real-money trading history dies with it. This pull is the only copy
+  that isn't on the droplet. It keeps 30 dated snapshots.
+
+It is **one-way by construction**: it takes a read-only `sqlite3 .backup`
+snapshot on the server (safe while the bot is writing — the DB is in WAL mode,
+so a plain `scp` of the file could catch a torn write) and copies *down*. It
+never writes to `/root/divergence-bot`. A corrupt or interrupted download is
+verified and rejected *before* it can replace the last good backup.
+
+Your local `positions.db` is the **dry-run/dev** database (`live=0`) and is
+**never touched** — the live DB lands in `server_mirror/`, kept separate so the
+two can never be confused. `server_mirror/` is gitignored: it holds real
+trading history.
+
+**2. Glance at Discord.** Nothing to run.
 
 | Channel | What good looks like | When to act |
 |---|---|---|
@@ -522,6 +562,7 @@ handle it. Paste the output.
 | `audit_reporting.py` | **the standing reporting-truth diagnostic.** Run it whenever numbers look wrong. |
 | `edge_report.py` | the weekly strategy review |
 | `check_parity.py` | is the server running exactly what's on main? (run local) |
+| `pull_server_state.py` | **daily.** Pulls live DB + server ratings DOWN into `server_mirror/`. One-way; the only backup of the live money record. |
 | `repair_miscancelled.py` | standing repair tool for wrongly-cancelled rows |
 | `name_match.py` | Polymarket name → Elo name resolution (exact → alias → fuzzy) |
 | `elo/` | the rating engines — `engine`, `basketball`, `tennis`, `mlb`, `soccer`, `esports`, `lol_players`, `rosters`, `injuries`, `history`, `params` |
