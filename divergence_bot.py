@@ -780,13 +780,82 @@ def guard_untracked_exchange_state(auth):
         return
     if not exchange_slugs:
         return
-    known = {r[0] for r in db("SELECT market_slug FROM positions", fetch=True)}
+    known_bot = {r[0] for r in db("SELECT market_slug FROM positions", fetch=True)}
+    known_manual = {r[0] for r in db(
+        "SELECT market_slug FROM manual_trades WHERE live=1 AND status IN ('pending','open')",
+        fetch=True,
+    )}
+    known = known_bot | known_manual
+    unknown = exchange_slugs - known
+    if unknown:
+        try:
+            response = auth.portfolio.activities({"limit": 100})
+            activities = response.get("activities") if isinstance(response, dict) else []
+        except Exception as e:
+            log.warning(f"Could not inspect exchange activity for manual trades: {e}")
+            activities = []
+        for slug in unknown:
+            if _import_manual_exchange_trade(slug, activities or []):
+                known.add(slug)
+                known_manual.add(slug)
+    # A manual exchange position is known, but it must still prevent the bot
+    # from placing a second position on the same market.
+    risk._UNTRACKED_SLUGS_THIS_RUN.update(exchange_slugs & known_manual)
     for slug in sorted(exchange_slugs - known):
         if slug not in risk._UNTRACKED_SLUGS_THIS_RUN:
             risk._UNTRACKED_SLUGS_THIS_RUN.add(slug)
             log.critical(f"UNTRACKED exchange position/order on {slug} — present on the "
                          f"exchange but not in positions.db. Blocking bot entries on it; "
                          f"reconcile it manually (cancel it or add a row to positions.db).")
+
+
+def _money_value(value) -> float:
+    try:
+        return float((value or {}).get("value") if isinstance(value, dict) else value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _import_manual_exchange_trade(slug: str, activities: list[dict]) -> bool:
+    """Import only filled activity explicitly marked manual by the exchange."""
+    fills = []
+    for activity in activities:
+        trade = activity.get("trade") if isinstance(activity, dict) else None
+        execution = (trade or {}).get("aggressorExecution") or {}
+        order = execution.get("order") or (trade or {}).get("aggressor") or {}
+        if (order.get("marketSlug") != slug
+                or order.get("manualOrderIndicator") != "MANUAL_ORDER_INDICATOR_MANUAL"):
+            continue
+        quantity = _money_value((trade or {}).get("qtyDecimal") or (trade or {}).get("qty")
+                                or execution.get("lastShares"))
+        cost = _money_value((trade or {}).get("cost"))
+        fee = _money_value(execution.get("commissionNotionalCollected"))
+        if quantity > 0 and cost > 0:
+            fills.append((trade, order, quantity, cost + fee))
+    if not fills:
+        return False
+    quantity = sum(fill[2] for fill in fills)
+    stake = sum(fill[3] for fill in fills)
+    if quantity <= 0 or stake <= 0:
+        return False
+    trade, order, _, _ = fills[0]
+    meta = order.get("marketMetadata") or trade.get("market") or {}
+    team = meta.get("team") or {}
+    side = meta.get("outcome") or team.get("name") or "manual"
+    sport = str(team.get("league") or "manual").upper()
+    created_at = min(str(fill[0].get("createTime") or "") for fill in fills) or datetime.now(timezone.utc).isoformat()
+    order_ids = ",".join(str(fill[1].get("id")) for fill in fills if fill[1].get("id"))
+    db(
+        """INSERT INTO manual_trades
+           (created_at, updated_at, market_slug, matchup, sport, side, price,
+            quantity, stake, live, order_id, status, notes)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (created_at, datetime.now(timezone.utc).isoformat(), slug,
+         meta.get("title") or slug, sport, side, stake / quantity, quantity,
+         stake, 1, order_ids, "open", "Auto-imported from exchange manual activity."),
+    )
+    log.warning(f"AUTO-IMPORTED manual exchange trade {slug}: ${stake:.2f}")
+    return True
 
 
 def record_valid_signal(cand: dict, stake: float) -> None:
@@ -1510,7 +1579,11 @@ def _resolution_pnl(auth, slug: str):
     if not resp["activities"]:
         return None
     activities = resp["activities"]
-    pr = activities[0].get("positionResolution") or {}
+    activity = next((a for a in activities
+                     if isinstance(a, dict) and isinstance(a.get("positionResolution"), dict)), None)
+    if activity is None:
+        return None  # the endpoint answered, but has no resolution for this market
+    pr = activity["positionResolution"]
     before = pr.get("beforePosition") or {}
     try:
         cost = float((before.get("cost") or {}).get("value"))
@@ -1519,7 +1592,7 @@ def _resolution_pnl(auth, slug: str):
         log.warning(f"Unrecognized resolution activity format for {slug}")
         return RESOLUTION_CHECK_FAILED
     stable = True  # unknown age -> assume stable (pre-updateTime API shapes)
-    raw_ts = pr.get("updateTime") or activities[0].get("updateTime")
+    raw_ts = pr.get("updateTime") or activity.get("updateTime")
     if raw_ts:
         try:
             ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
@@ -1613,6 +1686,31 @@ def check_settlements(client, auth=None):
         _STUCK_SETTLEMENT_WARNED.pop(pid, None)
         log.info(f"SETTLED {status.upper()} {slug} ({'long' if long_side else 'short'})  P&L {pnl:+.2f}")
     return settled_ids
+
+
+def check_manual_settlements(auth) -> int:
+    """Settle open manual trades from the exchange without touching positions."""
+    if auth is None:
+        return 0
+    rows = db("SELECT id, market_slug FROM manual_trades WHERE live=1 AND status='open'", fetch=True)
+    settled = 0
+    for trade_id, slug in rows:
+        res = _resolution_pnl(auth, slug)
+        if not isinstance(res, tuple):
+            continue
+        pnl, _stable = res
+        status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
+        now = datetime.now(timezone.utc).isoformat()
+        db("""UPDATE manual_trades SET status=?, pnl=?, closed_at=?, updated_at=?,
+                                      close_reason='exchange resolution'
+              WHERE id=?""", (status, pnl, now, now, trade_id))
+        try:
+            reporting.post_discord_manual_trade(trade_id)
+        except Exception:
+            log.exception(f"Manual settlement Discord post failed for {slug}")
+        log.info(f"MANUAL TRADE SETTLED {status.upper()} {slug}  P&L {pnl:+.2f}")
+        settled += 1
+    return settled
 
 
 def reconcile_live_pnl(client):
@@ -1760,6 +1858,7 @@ def cmd_run():
             verify_cancelled_rows(auth)
             mark_rescheduled_positions(pub)
             settled_ids = check_settlements(pub, auth if config.LIVE else None)
+            manual_settled = check_manual_settlements(auth if config.LIVE else None)
             check_signal_settlements(pub)
             if config.LIVE:
                 reconcile_live_pnl(auth)
@@ -1767,6 +1866,9 @@ def cmd_run():
                 reporting.post_discord_settlements(settled_ids)
                 reporting.post_discord_paper_summary(f"{len(settled_ids)} position(s) settled")
                 reporting.post_discord_summary(f"{len(settled_ids)} position(s) settled")
+                last_discord_status = time.monotonic()
+            elif manual_settled:
+                reporting.post_discord_summary(f"{manual_settled} manual trade(s) settled")
                 last_discord_status = time.monotonic()
             interval = getattr(config, "DISCORD_STATUS_INTERVAL_MIN", 30) * 60
             if interval > 0 and time.monotonic() - last_discord_status >= interval:
