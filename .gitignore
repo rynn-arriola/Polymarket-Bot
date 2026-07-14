@@ -18,6 +18,11 @@ __pycache__/
 # Data cache (regenerable via fetch_oe.py / refresh_data.py, 297MB+)
 data/
 
+# Server mirror (pull_server_state.py): the LIVE money DB + the server's
+# generated ratings. Real trading history — never version-controlled. The *.db
+# rule above already covers the databases; this covers the .json files too.
+server_mirror/
+
 # XGBoost artifacts: only the approved LoL activation model is tracked.
 xgb_models/*
 !xgb_models/lol.meta.json

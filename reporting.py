@@ -328,11 +328,15 @@ def manual_stats_by_sport() -> list[dict]:
             for sport, n, pnl in rows]
 
 
-def signal_stats_for_period(kind: str) -> dict:
+def signal_stats_for_period(kind: str, decision: str | None = None) -> dict:
     """Paper-only results for every valid candidate the bot observed.
 
     These numbers never feed real P&L, bankroll, risk, or settlement reports.
     They exist to show whether price/risk filters are declining good signals.
+
+    decision: None = all signals, 'traded' = signals that became real orders,
+    'skipped' = everything else — the skipped cohort's record vs the traded
+    one is the direct answer to "are the filters declining good signals?".
     """
     if kind in ("today", "week", "month"):
         start, end = period_bounds_utc(kind)
@@ -345,6 +349,10 @@ def signal_stats_for_period(kind: str) -> dict:
         raise ValueError(f"Unknown signal stats period: {kind}")
     created_filter += " AND live = ?"
     args = args + (1 if config.LIVE else 0,)
+    if decision == "traded":
+        created_filter += " AND decision = 'traded'"
+    elif decision == "skipped":
+        created_filter += " AND decision != 'traded'"
     try:
         row = db(
             f"""SELECT COUNT(*),
@@ -414,6 +422,124 @@ def signal_not_traded_reasons(kind: str = "overall", limit: int = 4) -> list[tup
     except Exception:
         return []
     return [(str(reason or "unknown"), count or 0) for reason, count in rows]
+
+
+def signal_stats_by_divergence() -> list[dict]:
+    """stats_by_divergence, but on the paper ledger — with the ledger's wider
+    price/no-risk-gate sample, this is the bucket table the live one will
+    grow into. Estimated P&L only; never blends with real positions."""
+    live = 1 if config.LIVE else 0
+    out = []
+    for lo, hi in DIVERGENCE_BUCKETS:
+        try:
+            settled, won, lost, pnl, avg_model = db(
+                """SELECT COUNT(*),
+                           SUM(CASE WHEN status='won' THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END),
+                           COALESCE(SUM(paper_pnl), 0),
+                           AVG(model_prob)
+                    FROM shadow_signals
+                    WHERE divergence >= ? AND divergence < ?
+                      AND status IN ('won','lost','push') AND live = ?""",
+                (lo, hi, live), fetch=True,
+            )[0]
+            avg_clv, clv_n = db(
+                """SELECT AVG(closing_price - market_price), COUNT(*)
+                   FROM shadow_signals
+                   WHERE divergence >= ? AND divergence < ?
+                     AND closing_price IS NOT NULL AND market_price IS NOT NULL AND live = ?""",
+                (lo, hi, live), fetch=True,
+            )[0]
+        except Exception:
+            settled = won = lost = clv_n = 0
+            pnl, avg_model, avg_clv = 0.0, None, None
+        out.append({
+            "bucket": f"{lo:.0%}-{hi:.0%}",
+            "settled": settled or 0,
+            "won": won or 0,
+            "lost": lost or 0,
+            "pnl": pnl or 0.0,
+            "win_rate": pct(won or 0, lost or 0),
+            "avg_model_prob": avg_model,
+            "avg_clv": avg_clv,
+            "clv_n": clv_n or 0,
+        })
+    return out
+
+
+def signal_stats_by_price() -> list[dict]:
+    """stats_by_price on the paper ledger. The ledger records 5%-95% while
+    live orders start at 30% — so the low bands here are the ONLY evidence
+    for whether the live floor is leaving money on the table."""
+    live = 1 if config.LIVE else 0
+    out = []
+    for lo, hi in PRICE_BUCKETS:
+        try:
+            settled, won, lost, pnl, avg_price = db(
+                """SELECT COUNT(*),
+                           SUM(CASE WHEN status='won' THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END),
+                           COALESCE(SUM(paper_pnl), 0),
+                           AVG(price)
+                    FROM shadow_signals
+                    WHERE price >= ? AND price < ?
+                      AND status IN ('won','lost','push') AND live = ?""",
+                (lo, hi, live), fetch=True,
+            )[0]
+        except Exception:
+            settled = won = lost = 0
+            pnl, avg_price = 0.0, None
+        won, lost = won or 0, lost or 0
+        breakeven = (avg_price + FEE_PCT) if avg_price is not None else None
+        wr = won / (won + lost) if (won + lost) else None
+        out.append({
+            "bucket": f"{lo:.0%}-{hi:.0%}",
+            "settled": settled or 0, "won": won, "lost": lost,
+            "pnl": pnl or 0.0,
+            "win_rate": wr,
+            "breakeven": breakeven,
+            "beats": (None if wr is None or breakeven is None
+                      else wr > breakeven),
+        })
+    return out
+
+
+def signal_stats_by_sport() -> list[dict]:
+    """stats_by_sport on the paper ledger, worst win rate first."""
+    live = 1 if config.LIVE else 0
+    try:
+        rows = db(
+            """SELECT sport,
+                       COUNT(*) AS entries,
+                       SUM(CASE WHEN status='won' THEN 1 ELSE 0 END) AS won,
+                       SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END) AS lost,
+                       SUM(CASE WHEN status='push' THEN 1 ELSE 0 END) AS push,
+                       COALESCE(SUM(CASE WHEN status IN ('won','lost','push')
+                                         THEN paper_pnl ELSE 0 END), 0) AS pnl
+                FROM shadow_signals
+                WHERE live = ?
+                GROUP BY sport""",
+            (live,), fetch=True,
+        )
+    except Exception:
+        return []
+    results = []
+    for sport, entries, won, lost, push, pnl in rows:
+        results.append({
+            "sport": sport or "UNKNOWN", "entries": entries,
+            "won": won or 0, "lost": lost or 0, "push": push or 0,
+            "settled": (won or 0) + (lost or 0) + (push or 0),
+            "pnl": pnl or 0.0, "win_rate": pct(won or 0, lost or 0),
+        })
+
+    def sort_key(r):
+        settled = r["won"] + r["lost"]
+        if settled == 0:
+            return (1, 0.0, -r["entries"])
+        return (0, r["won"] / settled, -r["entries"])
+
+    results.sort(key=sort_key)
+    return results
 
 
 def summary_snapshot() -> dict:
@@ -915,31 +1041,87 @@ def discord_manual_field(stats: dict, inline: bool = False) -> dict | None:
     }
 
 
-def discord_signal_field(stats: dict, inline: bool = False) -> dict | None:
-    if not stats.get("entries"):
-        return None
-    clv_line = ""
-    if stats.get("clv_n"):
-        clv_line = f"CLV:      {stats['avg_clv']:+.1%} (beat {stats['clv_beat']:.0%}, n={stats['clv_n']})\n"
-    blocks = signal_not_traded_reasons()
-    blocks_line = ""
-    if blocks:
-        shown = "; ".join(f"{count}x {reason[:52]}" for reason, count in blocks)
-        blocks_line = f"Blocked:  {shown}\n"
+def discord_paper_field(label: str, stats: dict, inline: bool) -> dict:
+    """One period of paper-signal stats, visually matching discord_field."""
     return {
-        "name": "Paper Signals (not real P&L)",
+        "name": f"{pnl_emoji(stats['paper_pnl'])} {label}",
         "value": (
             "```ansi\n"
-            f"Est P&L:  {stats['paper_pnl']:+.2f}\n"
-            f"Record:    {stats['won']}W / {stats['lost']}L / {stats['push']}P\n"
-            f"Signals:   {stats['entries']} (traded {stats['traded']}, not traded {stats['not_traded']})\n"
-            f"Open:      {stats['open']}\n"
-            f"{clv_line}"
-            f"{blocks_line}"
+            f"Est P&L:  {pnl_ansi(stats['paper_pnl'])}\n"
+            f"Record:   {stats['won']}W / {stats['lost']}L / {stats['push']}P\n"
+            f"Win rate: {stats['win_rate']}\n"
+            f"Signals:  {stats['entries']} (open {stats['open']})\n"
+            f"Taken:    {stats['traded']} | Skipped: {stats['not_traded']}\n"
             "```"
         ),
         "inline": inline,
     }
+
+
+def post_discord_paper_summary(reason: str = "Paper tracking update") -> bool:
+    """The paper-signal ledger's OWN status embed, mirroring the real
+    summary's layout (Today/Week/Month/Overall) so the two read side by side
+    but never blend. Adds the split the ledger exists for — the skipped
+    cohort's record vs the taken one — plus CLV and top block reasons.
+
+    Posts to DISCORD_PAPER_WEBHOOK_URL when set (its own channel), else to
+    the main summary webhook as a separate message.
+    """
+    webhook = (getattr(config, "DISCORD_PAPER_WEBHOOK_URL", "").strip()
+               or getattr(config, "DISCORD_WEBHOOK_URL", "").strip())
+    if not webhook:
+        return False
+    overall = signal_stats_for_period("overall")
+    if not overall.get("entries"):
+        return False  # nothing recorded yet — stay quiet
+    today = signal_stats_for_period("today")
+    fields = [
+        discord_paper_field("Today", today, True),
+        discord_paper_field("This Week", signal_stats_for_period("week"), True),
+        discord_paper_field("This Month", signal_stats_for_period("month"), True),
+        discord_paper_field("Overall", overall, False),
+    ]
+
+    # THE question this ledger answers: do the signals the filters decline
+    # perform differently from the ones that became real orders?
+    split_lines = [f"{'cohort':<9}{'n':>5}{'record':>10}{'win%':>7}{'est P&L':>10}{'CLV':>8}"]
+    for label, cohort in (("taken", "traded"), ("skipped", "skipped")):
+        s = signal_stats_for_period("overall", cohort)
+        record = f"{s['won']}W-{s['lost']}L"
+        clv = f"{s['avg_clv']:+.2%}" if s.get("clv_n") else "--"
+        code = "32" if s["paper_pnl"] > 0 else "31" if s["paper_pnl"] < 0 else "2;37"
+        split_lines.append(
+            f"\x1b[{code}m{label:<9}{s['entries']:>5}{record:>10}{s['win_rate']:>7}"
+            f"{s['paper_pnl']:>+10.2f}{clv:>8}\x1b[0m"
+        )
+    fields.append({
+        "name": "Taken vs skipped (all-time) — are the filters right?",
+        "value": "```ansi\n" + "\n".join(split_lines) + "\n```",
+        "inline": False,
+    })
+
+    blocks = signal_not_traded_reasons()
+    if blocks:
+        fields.append({
+            "name": "Top skip reasons (all-time)",
+            "value": "```ansi\n" + "\n".join(
+                f"{count:>4}x  {reason[:70]}" for reason, count in blocks) + "\n```",
+            "inline": False,
+        })
+
+    payload = {
+        "username": BOT_NAME,
+        "embeds": [{
+            "title": "🧪 Paper Signals — tracking only",
+            "description": f"{reason} • every valid signal, incl. declined ones — "
+                           "estimated results, excluded from real P&L",
+            "color": embed_color(today["paper_pnl"]),
+            "fields": fields,
+            "footer": {"text": f"{BOT_NAME} | 🧪 paper ledger — not real money"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }],
+    }
+    return _post(webhook, payload, "paper summary")
 
 
 def post_discord_summary(reason: str = "Status update") -> bool:
@@ -957,9 +1139,9 @@ def post_discord_summary(reason: str = "Status update") -> bool:
     manual_field = discord_manual_field(snapshot.get("manual_overall", {}), False)
     if manual_field:
         fields.append(manual_field)
-    signal_field = discord_signal_field(snapshot.get("signals_overall", {}), False)
-    if signal_field:
-        fields.append(signal_field)
+    # Paper signals intentionally NOT here — they have their own embed
+    # (post_discord_paper_summary) on the same cadence, so estimated
+    # numbers never sit inside the real-money summary.
     payload = {
         "username": BOT_NAME,
         "embeds": [
@@ -1018,23 +1200,8 @@ def post_discord_daily_digest() -> bool:
                   f"Entries {ov['entries']} (open {ov['open']})\n```"),
         "inline": False,
     }]
-    signals_overall = signal_stats_for_period("overall")
-    if signals_overall.get("entries"):
-        signal_lines = [f"{'period':<10}{'sig':>5}{'taken':>7}{'skip':>6}{'record':>10}{'est P&L':>10}{'CLV':>8}"]
-        for label, kind in (("Today", "today"), ("Overall", "overall")):
-            s = signal_stats_for_period(kind)
-            record = f"{s['won']}W-{s['lost']}L"
-            clv = f"{s['avg_clv']:+.2%}" if s.get("clv_n") else "--"
-            code = "32" if s["paper_pnl"] > 0 else "31" if s["paper_pnl"] < 0 else "2;37"
-            signal_lines.append(
-                f"\x1b[{code}m{label:<10}{s['entries']:>5}{s['traded']:>7}{s['not_traded']:>6}"
-                f"{record:>10}{s['paper_pnl']:>+10.2f}{clv:>8}\x1b[0m"
-            )
-        fields.append({
-            "name": "Paper signals (all valid candidates; excluded from real P&L)",
-            "value": "```ansi\n" + "\n".join(signal_lines) + "\n```",
-            "inline": False,
-        })
+    # Paper signals are NOT in the digest — they live on their own embed
+    # (post_discord_paper_summary), keeping this digest real-money only.
 
     manual = manual_stats_for_period("overall")
     if manual.get("entries"):
@@ -1174,23 +1341,7 @@ def post_discord_clv(reason: str = "CLV update") -> bool:
             "inline": False,
         })
 
-    paper_overall = signal_stats_for_period("overall")
-    if paper_overall.get("entries"):
-        paper_lines = [f"{'period':<10}{'sig':>5}{'taken':>7}{'skip':>6}{'record':>10}{'est P&L':>10}{'CLV':>8}"]
-        for label, kind in (("Today", "today"), ("Overall", "overall")):
-            s = signal_stats_for_period(kind)
-            record = f"{s['won']}W-{s['lost']}L"
-            clv = f"{s['avg_clv']:+.2%}" if s.get("clv_n") else "--"
-            code = "32" if s["paper_pnl"] > 0 else "31" if s["paper_pnl"] < 0 else "2;37"
-            paper_lines.append(
-                f"\x1b[{code}m{label:<10}{s['entries']:>5}{s['traded']:>7}{s['not_traded']:>6}"
-                f"{record:>10}{s['paper_pnl']:>+10.2f}{clv:>8}\x1b[0m"
-            )
-        fields.append({
-            "name": "Paper signals (all valid candidates; excluded from real P&L)",
-            "value": "```ansi\n" + "\n".join(paper_lines) + "\n```",
-            "inline": False,
-        })
+    # Paper signals are NOT here either — see post_discord_paper_summary.
 
     # Per-sport win rate — lives here on the CLV tracker (kept off the summary).
     sport_rows = stats_by_sport()
@@ -1248,6 +1399,115 @@ def post_discord_clv(reason: str = "CLV update") -> bool:
         }],
     }
     return _post(webhook, payload, "CLV report")
+
+
+def post_discord_paper_clv(reason: str = "Paper CLV update") -> bool:
+    """The paper ledger's own CLV report, mirroring post_discord_clv section
+    for section (CLV by period, by divergence bucket, win rate vs break-even
+    by entry price, per-sport) but computed entirely from shadow_signals —
+    estimated results, never blended with real positions. The ledger records
+    the full 5%-95% price range while live orders start at 30%, so this is
+    where a mispriced filter shows up first.
+
+    Posts to DISCORD_PAPER_WEBHOOK_URL when set, else alongside the real CLV
+    report on DISCORD_CLV_WEBHOOK_URL, else the main webhook."""
+    webhook = (getattr(config, "DISCORD_PAPER_WEBHOOK_URL", "").strip()
+               or getattr(config, "DISCORD_CLV_WEBHOOK_URL", "").strip()
+               or getattr(config, "DISCORD_WEBHOOK_URL", "").strip())
+    if not webhook:
+        return False
+    overall = signal_stats_for_period("overall")
+    if not overall.get("entries"):
+        return False  # nothing recorded yet — stay quiet
+    overall_clv = overall.get("avg_clv") if overall.get("clv_n") else None
+
+    period_lines = [f"{'period':<10}{'avg CLV':>9}{'beat':>7}{'n':>6}"]
+    for label, kind in (("Today", "today"), ("This Week", "week"), ("Overall", "overall")):
+        s = signal_stats_for_period(kind)
+        if s.get("clv_n"):
+            code = "32" if s["avg_clv"] > 0 else "31" if s["avg_clv"] < 0 else "2;37"
+            period_lines.append(f"\x1b[{code}m{pnl_emoji(s['avg_clv'])} {label:<8}{s['avg_clv']:>+9.2%}"
+                                f"{s['clv_beat']:>7.0%}{s['clv_n']:>6}\x1b[0m")
+        else:
+            period_lines.append(f"⚪ {label:<8}{'--':>9}{'--':>7}{0:>6}")
+    fields = [{
+        "name": "CLV by period",
+        "value": "```ansi\n" + "\n".join(period_lines) + "\n```",
+        "inline": False,
+    }]
+
+    div_rows = signal_stats_by_divergence()
+    if any(r.get("clv_n") for r in div_rows):
+        bl = [f"{'bucket':<9}{'avg CLV':>9}{'n':>6}"]
+        for r in div_rows:
+            if r.get("avg_clv") is not None:
+                code = "32" if r["avg_clv"] > 0 else "31" if r["avg_clv"] < 0 else "2;37"
+                bl.append(f"\x1b[{code}m{pnl_emoji(r['avg_clv'])} {r['bucket']:<7}{r['avg_clv']:>+9.2%}{r['clv_n']:>6}\x1b[0m")
+            else:
+                bl.append(f"⚪ {r['bucket']:<7}{'--':>9}{r['clv_n']:>6}")
+        fields.append({
+            "name": "CLV by divergence size (bigger gap should beat the close more)",
+            "value": "```ansi\n" + "\n".join(bl) + "\n```",
+            "inline": False,
+        })
+
+    price_rows = signal_stats_by_price()
+    if any(r["settled"] for r in price_rows):
+        pl = [f"{'price':<9}{'record':<9}{'WR':>6}{'brkev':>7}{'est P&L':>9}"]
+        for r in price_rows:
+            if r["win_rate"] is None:
+                if r["settled"]:  # pushes only
+                    continue
+                pl.append(f"⚪ {r['bucket']:<7}{'--':<9}{'--':>6}{'--':>7}{'--':>9}")
+                continue
+            code = "32" if r["beats"] else "31"
+            mark = pnl_emoji(1 if r["beats"] else -1)
+            rec = f"{r['won']}W-{r['lost']}L"
+            pl.append(f"\x1b[{code}m{mark} {r['bucket']:<7}{rec:<9}{r['win_rate']:>6.0%}"
+                      f"{r['breakeven']:>7.0%}{r['pnl']:>+9.2f}\x1b[0m")
+        fields.append({
+            "name": "Win rate vs break-even, by entry price (low bands = what the live floor skips)",
+            "value": "```ansi\n" + "\n".join(pl) + "\n```",
+            "inline": False,
+        })
+
+    sport_rows = signal_stats_by_sport()
+    if sport_rows:
+        sl = [f"{'SPORT':<10}{'RECORD':<12}{'WR':>7}{'est P&L':>10}{'SIG':>6}"]
+        for r in sport_rows:
+            wr = r["win_rate"] if (r["won"] + r["lost"]) else "n/a"
+            rec = f"{r['won']}W-{r['lost']}L-{r['push']}P"
+            code = "32" if r["pnl"] > 0 else "31" if r["pnl"] < 0 else "2;37"
+            sl.append(f"\x1b[{code}m{r['sport']:<10}{rec:<12}{wr:>7}{r['pnl']:>+10.2f}{r['entries']:>6}\x1b[0m")
+        for i, chunk in enumerate(_chunk_ansi_lines(sl)):
+            fields.append({
+                "name": "Per-sport win rate (worst first)" if i == 0 else "​",
+                "value": "```ansi\n" + "\n".join(chunk) + "\n```",
+                "inline": False,
+            })
+
+    mode_badge = "🔴 LIVE" if config.LIVE else "🧪 DRY-RUN"
+    if overall_clv is None:
+        sidebar, verdict = 0x1ABC9C, "⚪ No paper CLV captured yet"
+    else:
+        sidebar = embed_color(overall_clv)
+        verdict = (f"{pnl_emoji(overall_clv)} Paper CLV {overall_clv:+.2%} — "
+                   + ("market moving TOWARD the signals (model looks real)" if overall_clv > 0
+                      else "market moving AGAINST the signals" if overall_clv < 0
+                      else "flat"))
+    payload = {
+        "username": BOT_NAME,
+        "embeds": [{
+            "title": "🧪 Paper CLV Report — tracking only",
+            "description": f"**{verdict}**\n{reason} — every valid signal incl. declined ones; "
+                           "estimated results, excluded from real P&L.",
+            "color": sidebar,
+            "fields": fields,
+            "footer": {"text": f"{BOT_NAME} | {mode_badge} | 🧪 paper ledger — not real money"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }],
+    }
+    return _post(webhook, payload, "paper CLV report")
 
 
 def post_discord_settlements(position_ids: list[int]) -> int:

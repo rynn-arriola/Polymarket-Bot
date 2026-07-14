@@ -79,7 +79,8 @@ def db_init():
                        ("original_game_start", "TEXT"), ("rescheduled_start", "TEXT"),
                        ("rescheduled_at", "TEXT"),
                        ("closing_price", "REAL"), ("closing_captured_at", "TEXT"),
-                       ("pnl_reconciled", "INTEGER DEFAULT 0")):
+                       ("pnl_reconciled", "INTEGER DEFAULT 0"),
+                       ("cancel_verified", "INTEGER DEFAULT 0")):
         if name not in have:
             con.execute(f"ALTER TABLE positions ADD COLUMN {name} {decl}")
     con.execute(

@@ -1,2 +1,9 @@
 polymarket-us
 tzdata
+
+# Gated XGBoost inference (xgb_live). Needed whenever a model under xgb_models/
+# clears its gate — without these the load fails and the sport falls back to Elo
+# instead of trading the model. numpy is listed explicitly because xgb_live
+# imports it directly, not merely as an xgboost transitive dep.
+xgboost>=2.0
+numpy>=1.24

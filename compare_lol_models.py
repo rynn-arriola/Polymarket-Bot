@@ -4,7 +4,7 @@ difference is purely the model, not the sample.
 
 Prints both Briers across a small K sweep for the player model (its best K is
 unknown a priori) and a per-bucket table for the winner. The verdict decides
-what the live bot uses for LoL (see README roadmap).
+what the live bot uses for LoL (see OPERATOR.md).
 
 Usage: python compare_lol_models.py
 """

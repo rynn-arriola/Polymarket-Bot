@@ -1106,23 +1106,20 @@ def confirm_fills(client):
             # NEW / PARTIALLY_FILLED / PENDING_* -> still working, stays pending
             # (cancel_stale_orders resolves it at the CANCEL_UNFILLED_AFTER_MIN mark).
             continue
-        # st is "NOT_FOUND" (definitively gone) or None (transient failure).
-        # Either way, ask the portfolio about THIS market specifically — the
-        # per-market filter can't be fooled by pagination the way the full
-        # listing was. Only NOT_FOUND cancels an absent row — a transient
-        # failure leaves it pending to retry (a blip can't wrongly cancel a
-        # live resting order), and an inconclusive lookup (None) never
-        # decides anything.
+        # st is "NOT_FOUND" or None (transient failure). Ask the portfolio
+        # about THIS market specifically — the per-market filter can't be
+        # fooled by pagination the way the full listing was. A visible
+        # position confirms the fill; anything else leaves the row pending.
+        # Absence NEVER cancels here — not even NOT_FOUND: a just-placed
+        # order can be invisible to the exchange's read path for a moment
+        # (three orders were mis-cancelled <1s after placement on 2026-07-14,
+        # then filled and resolved unseen). Giving up on an order is solely
+        # cancel_stale_orders' job: it waits CANCEL_UNFILLED_AFTER_MIN and
+        # issues a definitive cancel before concluding anything.
         qty = _position_quantity(client, slug)
-        if qty is None:
-            continue  # lookup failed — retry next cycle
-        if qty > 0:
+        if qty is not None and qty > 0:
             _mark_open(pid, slug, price, quantity,
                        min(_as_int(qty), _as_int(quantity)) or _as_int(quantity))
-        elif st == "NOT_FOUND":
-            db("UPDATE positions SET status='cancelled' WHERE id=?", (pid,))
-            log.info(f"Order {order_id} on {slug} not found on the exchange and no position "
-                     f"held — marked cancelled")
 
 
 def cancel_stale_orders(client):
@@ -1143,6 +1140,14 @@ def cancel_stale_orders(client):
             # CancelOrderParams requires the market slug (SDK 0.1.2) — a
             # single-arg cancel raises TypeError and never cancels.
             client.orders.cancel(order_id, {"marketSlug": slug})
+        except NotFoundError:
+            # The exchange doesn't know this order (sync reject, or already
+            # purged). At CANCEL_UNFILLED_AFTER_MIN old that's definitive —
+            # read-path lag is a seconds-scale phenomenon — so fall through
+            # to the fill checks below and resolve the row. Without this,
+            # a never-rested order would stay pending forever, since
+            # confirm_fills deliberately never cancels on absence.
+            pass
         except Exception as e:
             log.warning(f"Cancel failed for {slug}: {e}")
             continue
@@ -1172,6 +1177,74 @@ def cancel_stale_orders(client):
         else:
             db("UPDATE positions SET status='cancelled' WHERE id=?", (pid,))
             log.info(f"Cancelled unfilled order on {slug} after {age_min:.0f} min")
+
+
+def verify_cancelled_rows(auth):
+    """Self-heal mis-cancelled rows: cross-check every live 'cancelled' row
+    against the exchange ONCE, and restore it if the exchange disagrees.
+
+    Both mis-cancel incidents (2026-07-13 pagination, 2026-07-14 read-path
+    lag) had the same shape: the DB said cancelled while the exchange held a
+    real position — settled losses invisible to reporting until repaired by
+    hand. The exchange is the source of truth, so verify against it:
+
+      - position still held        -> restore to 'open' (normal settlement
+                                      flow takes it from there)
+      - POSITION_RESOLUTION posted -> settle with the exchange's own
+                                      fee-inclusive P&L
+      - neither                    -> genuinely cancelled; flag verified so
+                                      the row is never checked again
+
+    Checks wait until the row is a few minutes old so the exchange's read
+    path has certainly indexed any fill, and each row is verified at most
+    once, so the steady-state API cost is zero. Known blind spot: a
+    MANUAL position on the same market would make a correctly-cancelled bot
+    row look filled — acceptable; the loud ops log makes any heal visible.
+    """
+    if not config.LIVE:
+        return
+    rows = db(
+        "SELECT id, market_slug, price, quantity, created_at FROM positions "
+        "WHERE live=1 AND status='cancelled' AND COALESCE(cancel_verified,0)=0",
+        fetch=True,
+    )
+    grace = 5  # minutes; read-path lag is seconds-scale, this is ample
+    for pid, slug, price, quantity, created_at in rows:
+        try:
+            age_min = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(created_at)).total_seconds() / 60
+        except (TypeError, ValueError):
+            age_min = None
+        if age_min is not None and age_min < grace:
+            continue  # too young for the exchange read path to be trustworthy
+        qty = _position_quantity(auth, slug)
+        if qty is None:
+            continue  # lookup failed — retry next cycle
+        if qty > 0:
+            _mark_open(pid, slug, price, quantity,
+                       min(_as_int(qty), _as_int(quantity)) or _as_int(quantity))
+            db("UPDATE positions SET cancel_verified=1 WHERE id=?", (pid,))
+            log.warning(f"MIS-CANCEL healed: {slug} was marked cancelled but the "
+                        f"exchange holds {qty:.0f} contract(s) — restored to open")
+            continue
+        res = _resolution_pnl(auth, slug)
+        if isinstance(res, tuple):
+            pnl, stable = res
+            status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
+            db("UPDATE positions SET status=?, pnl=?, settled_at=?, "
+               "pnl_reconciled=?, cancel_verified=1 WHERE id=?",
+               (status, pnl, datetime.now(timezone.utc).isoformat(),
+                1 if stable else 0, pid))
+            log.warning(f"MIS-CANCEL healed: {slug} was marked cancelled but "
+                        f"resolved on the exchange — settled {status.upper()} "
+                        f"P&L {pnl:+.2f}")
+            continue
+        if res is RESOLUTION_CHECK_FAILED:
+            continue  # couldn't check — retry next cycle, conclude NOTHING
+        # res is None: the feed answered — no position, no resolution.
+        # Only this definitive answer marks the cancel verified.
+        db("UPDATE positions SET cancel_verified=1 WHERE id=?", (pid,))
+    return
 
 
 def mark_rescheduled_positions(pub) -> int:
@@ -1404,10 +1477,20 @@ def check_signal_settlements(client) -> int:
 _STUCK_SETTLEMENT_WARNED: dict = {}  # pid -> monotonic time of last "stuck" warning
 
 
-def _resolution_pnl(auth, slug: str) -> tuple[float, bool] | None:
+# Sentinel: the resolution check itself FAILED (feed down, rate-limited,
+# unrecognized shape). Distinct from None = the feed answered and there is
+# definitively no resolution. verify_cancelled_rows marked a mis-cancelled
+# row (ica-dnt, 2026-07-14) verified-forever off one transient failure
+# because the two cases were conflated — callers must retry on this value
+# and never conclude anything from it.
+RESOLUTION_CHECK_FAILED = object()
+
+
+def _resolution_pnl(auth, slug: str):
     """(P&L, stable) from the account's POSITION_RESOLUTION activity for this
-    market, or None if the exchange hasn't resolved it (or the feed is
-    unavailable — callers fall back to the public settlement endpoint).
+    market; None when the feed answered and shows NO resolution (definitive);
+    RESOLUTION_CHECK_FAILED when the check itself failed — retry later.
+    Callers should branch with isinstance(res, tuple) for the settled case.
 
     `stable` is False while the activity is younger than
     RESOLUTION_STABLE_MINUTES: the exchange RESTATES the cost basis (rolls
@@ -1427,10 +1510,12 @@ def _resolution_pnl(auth, slug: str) -> tuple[float, bool] | None:
         })
     except Exception as e:
         log.warning(f"Resolution-activity check failed for {slug}: {e}")
+        return RESOLUTION_CHECK_FAILED
+    if not isinstance(resp, dict) or "activities" not in resp:
+        return RESOLUTION_CHECK_FAILED  # unexpected shape is NOT an empty feed
+    if not resp["activities"]:
         return None
-    activities = resp.get("activities") if isinstance(resp, dict) else None
-    if not activities:
-        return None
+    activities = resp["activities"]
     pr = activities[0].get("positionResolution") or {}
     before = pr.get("beforePosition") or {}
     try:
@@ -1438,7 +1523,7 @@ def _resolution_pnl(auth, slug: str) -> tuple[float, bool] | None:
         cash_value = float((before.get("cashValue") or {}).get("value"))
     except (TypeError, ValueError):
         log.warning(f"Unrecognized resolution activity format for {slug}")
-        return None
+        return RESOLUTION_CHECK_FAILED
     stable = True  # unknown age -> assume stable (pre-updateTime API shapes)
     raw_ts = pr.get("updateTime") or activities[0].get("updateTime")
     if raw_ts:
@@ -1468,7 +1553,7 @@ def check_settlements(client, auth=None):
         # an estimate that reconcile_live_pnl corrects later.
         if live and auth is not None:
             res = _resolution_pnl(auth, slug)
-            if res is not None:
+            if isinstance(res, tuple):
                 pnl, stable = res
                 status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
                 # Settle NOW (Discord shouldn't wait), but only stamp the P&L
@@ -1551,8 +1636,8 @@ def reconcile_live_pnl(client):
     )
     for pid, slug in rows:
         res = _resolution_pnl(client, slug)
-        if res is None:
-            continue  # not posted yet / feed unavailable — retry next cycle
+        if not isinstance(res, tuple):
+            continue  # not posted yet / check failed — retry next cycle
         real_pnl, stable = res
         if not stable:
             # The exchange restates cost basis (fees) shortly after posting
@@ -1648,7 +1733,9 @@ def cmd_run():
     pub = make_client(False)
     auth = make_client(True)
     reporting.post_discord_summary("Bot started")
+    reporting.post_discord_paper_summary("Bot started")
     reporting.post_discord_clv("Bot started")
+    reporting.post_discord_paper_clv("Bot started")
     last_discord_status = time.monotonic()
     last_clv_report = time.monotonic()
 
@@ -1676,6 +1763,7 @@ def cmd_run():
             capture_closing_lines(pub)
             capture_signal_closing_lines(pub)
             cancel_stale_orders(auth)
+            verify_cancelled_rows(auth)
             mark_rescheduled_positions(pub)
             settled_ids = check_settlements(pub, auth if config.LIVE else None)
             check_signal_settlements(pub)
@@ -1684,15 +1772,18 @@ def cmd_run():
             if settled_ids:
                 reporting.post_discord_settlements(settled_ids)
                 reporting.post_discord_summary(f"{len(settled_ids)} position(s) settled")
+                reporting.post_discord_paper_summary(f"{len(settled_ids)} position(s) settled")
                 last_discord_status = time.monotonic()
             interval = getattr(config, "DISCORD_STATUS_INTERVAL_MIN", 30) * 60
             if interval > 0 and time.monotonic() - last_discord_status >= interval:
                 reporting.post_discord_summary("Scheduled status update")
+                reporting.post_discord_paper_summary("Scheduled status update")
                 last_discord_status = time.monotonic()
             # CLV report N times a day (default 4 = every 6h) on its own webhook
             per_day = getattr(config, "CLV_REPORT_TIMES_PER_DAY", 0)
             if per_day > 0 and time.monotonic() - last_clv_report >= 24 / per_day * 3600:
                 reporting.post_discord_clv("Scheduled CLV report")
+                reporting.post_discord_paper_clv("Scheduled CLV report")
                 last_clv_report = time.monotonic()
             reporting.maybe_post_daily_digest()
             reporting.maybe_post_ops_digest()

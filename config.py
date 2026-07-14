@@ -274,6 +274,10 @@ RESOLUTION_STABLE_MINUTES = 45
 # private: anyone with one can post into that channel.
 DISCORD_WEBHOOK_URL = _secret("DISCORD_WEBHOOK_URL")
 DISCORD_STATUS_INTERVAL_MIN = 5
+# Paper-signal tracking embed (fires alongside every status update above).
+# Blank = post to DISCORD_WEBHOOK_URL as its own separate message; set a
+# webhook here to route the paper ledger to its own channel instead.
+DISCORD_PAPER_WEBHOOK_URL = _secret("DISCORD_PAPER_WEBHOOK_URL")
 
 # Optional: a second webhook for one polished message per settled position
 # (includes what the model believed vs what the market charged at entry).
@@ -366,7 +370,7 @@ TENNIS_START_DATE = date(2019, 1, 1)
 TENNIS_TML_START_YEAR = 2019
 
 # --- ITF tennis data (fallback only — ESPN doesn't cover ITF) ---
-# See README.md: ESPN has no ITF endpoint, and Jeff Sackmann's public
+# See OPERATOR.md: ESPN has no ITF endpoint, and Jeff Sackmann's public
 # ITF match-history CSVs were unreachable when this was built — place
 # current CSVs (tourney_date/winner_name/loser_name columns, one row per
 # match) in data/tennis/itf/ if you find a source, otherwise ITF markets
