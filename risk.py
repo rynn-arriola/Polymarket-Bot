@@ -61,12 +61,19 @@ def risk_check(sport: str, event_id: str, market_slug_: str,
     # live MAX_OPEN_POSITIONS budget or block a live entry on the same event.
     live = 1 if config.LIVE else 0
 
-    open_count = db(
-        "SELECT COUNT(*) FROM positions WHERE status IN ('pending','open') AND live=?",
+    open_count, rescheduled_open = db(
+        """SELECT COUNT(*),
+                  SUM(CASE WHEN status='open' AND rescheduled_at IS NOT NULL THEN 1 ELSE 0 END)
+           FROM positions
+           WHERE status IN ('pending','open') AND live=?""",
         (live,), fetch=True,
-    )[0][0]
-    if open_count >= config.MAX_OPEN_POSITIONS:
-        return f"max open positions reached ({open_count})"
+    )[0]
+    rescheduled_open = rescheduled_open or 0
+    effective_max_open = config.MAX_OPEN_POSITIONS + rescheduled_open
+    if open_count >= effective_max_open:
+        suffix = (f" + {rescheduled_open} rescheduled"
+                  if rescheduled_open else "")
+        return f"max open positions reached ({open_count}/{effective_max_open}{suffix})"
 
     day_start, day_end = period_bounds_utc("today")
     sport_today = db(
