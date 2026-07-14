@@ -328,6 +328,94 @@ def manual_stats_by_sport() -> list[dict]:
             for sport, n, pnl in rows]
 
 
+def signal_stats_for_period(kind: str) -> dict:
+    """Paper-only results for every valid candidate the bot observed.
+
+    These numbers never feed real P&L, bankroll, risk, or settlement reports.
+    They exist to show whether price/risk filters are declining good signals.
+    """
+    if kind in ("today", "week", "month"):
+        start, end = period_bounds_utc(kind)
+        created_filter = "created_at >= ? AND created_at < ?"
+        args = (start, end)
+    elif kind == "overall":
+        created_filter = "1=1"
+        args = ()
+    else:
+        raise ValueError(f"Unknown signal stats period: {kind}")
+    created_filter += " AND live = ?"
+    args = args + (1 if config.LIVE else 0,)
+    try:
+        row = db(
+            f"""SELECT COUNT(*),
+                       SUM(CASE WHEN status='open' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN decision='traded' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN decision!='traded' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status='won' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status='push' THEN 1 ELSE 0 END),
+                       COALESCE(SUM(CASE WHEN status IN ('won','lost','push')
+                                         THEN paper_pnl ELSE 0 END), 0),
+                       AVG(closing_price - market_price),
+                       AVG(CASE
+                             WHEN closing_price IS NULL OR market_price IS NULL THEN NULL
+                             WHEN closing_price > market_price THEN 1.0
+                             ELSE 0.0
+                           END),
+                       SUM(CASE WHEN closing_price IS NOT NULL AND market_price IS NOT NULL
+                                THEN 1 ELSE 0 END)
+                FROM shadow_signals WHERE {created_filter}""",
+            args,
+            fetch=True,
+        )[0]
+    except Exception:
+        row = (0, 0, 0, 0, 0, 0, 0, 0.0, None, None, 0)
+    entries, open_n, traded, skipped, won, lost, push, pnl, avg_clv, clv_beat, clv_n = row
+    return {
+        "entries": entries or 0,
+        "open": open_n or 0,
+        "traded": traded or 0,
+        "not_traded": skipped or 0,
+        "won": won or 0,
+        "lost": lost or 0,
+        "push": push or 0,
+        "settled": (won or 0) + (lost or 0) + (push or 0),
+        "paper_pnl": pnl or 0.0,
+        "win_rate": pct(won or 0, lost or 0),
+        "avg_clv": avg_clv,
+        "clv_beat": clv_beat,
+        "clv_n": clv_n or 0,
+    }
+
+
+def signal_not_traded_reasons(kind: str = "overall", limit: int = 4) -> list[tuple[str, int]]:
+    """Most common final reasons valid signals did not become orders."""
+    if kind in ("today", "week", "month"):
+        start, end = period_bounds_utc(kind)
+        created_filter = "created_at >= ? AND created_at < ?"
+        args = (start, end)
+    elif kind == "overall":
+        created_filter = "1=1"
+        args = ()
+    else:
+        raise ValueError(f"Unknown signal reasons period: {kind}")
+    args = args + (1 if config.LIVE else 0, limit)
+    try:
+        rows = db(
+            f"""SELECT COALESCE(decision_reason, decision), COUNT(*)
+                FROM shadow_signals
+                WHERE {created_filter} AND live=? AND decision != 'traded'
+                GROUP BY COALESCE(decision_reason, decision)
+                ORDER BY COUNT(*) DESC, COALESCE(decision_reason, decision)
+                LIMIT ?""",
+            args,
+            fetch=True,
+        )
+    except Exception:
+        return []
+    return [(str(reason or "unknown"), count or 0) for reason, count in rows]
+
+
 def summary_snapshot() -> dict:
     return {
         "today": stats_for_period("today"),
@@ -338,6 +426,10 @@ def summary_snapshot() -> dict:
         "manual_week": manual_stats_for_period("week"),
         "manual_month": manual_stats_for_period("month"),
         "manual_overall": manual_stats_for_period("overall"),
+        "signals_today": signal_stats_for_period("today"),
+        "signals_week": signal_stats_for_period("week"),
+        "signals_month": signal_stats_for_period("month"),
+        "signals_overall": signal_stats_for_period("overall"),
         "mode": "LIVE" if config.LIVE else "DRY-RUN",
         "updated": datetime.now(timezone.utc).isoformat(),
     }
@@ -380,6 +472,21 @@ def format_manual_period(label: str, stats: dict) -> str:
     )
 
 
+def format_signal_period(label: str, stats: dict) -> str:
+    if not stats.get("entries"):
+        return ""
+    clv = ""
+    if stats.get("clv_n"):
+        clv = f"\n  CLV: {stats['avg_clv']:+.1%} avg | beat close {stats['clv_beat']:.0%} (n={stats['clv_n']})"
+    return (
+        f"{label} (paper only - excluded from real P&L)\n"
+        f"  Estimated P&L: {stats['paper_pnl']:+.2f}\n"
+        f"  Record: {stats['won']}W / {stats['lost']}L / {stats['push']}P\n"
+        f"  Win rate: {stats['win_rate']}\n"
+        f"  Signals: {stats['entries']} | Traded: {stats['traded']} | Not traded: {stats['not_traded']} | Open: {stats['open']}{clv}"
+    )
+
+
 def format_summary_text(snapshot: dict, title: str = "POLYBOT SUMMARY") -> str:
     text = (
         f"\n=== {title} ===\n"
@@ -392,6 +499,9 @@ def format_summary_text(snapshot: dict, title: str = "POLYBOT SUMMARY") -> str:
     manual = format_manual_period("Manual Trades", snapshot.get("manual_overall", {}))
     if manual:
         text += f"\n{manual}\n"
+    signals = format_signal_period("Valid Signals", snapshot.get("signals_overall", {}))
+    if signals:
+        text += f"\n{signals}\n"
     return text
 
 
@@ -805,6 +915,33 @@ def discord_manual_field(stats: dict, inline: bool = False) -> dict | None:
     }
 
 
+def discord_signal_field(stats: dict, inline: bool = False) -> dict | None:
+    if not stats.get("entries"):
+        return None
+    clv_line = ""
+    if stats.get("clv_n"):
+        clv_line = f"CLV:      {stats['avg_clv']:+.1%} (beat {stats['clv_beat']:.0%}, n={stats['clv_n']})\n"
+    blocks = signal_not_traded_reasons()
+    blocks_line = ""
+    if blocks:
+        shown = "; ".join(f"{count}x {reason[:52]}" for reason, count in blocks)
+        blocks_line = f"Blocked:  {shown}\n"
+    return {
+        "name": "Paper Signals (not real P&L)",
+        "value": (
+            "```ansi\n"
+            f"Est P&L:  {stats['paper_pnl']:+.2f}\n"
+            f"Record:    {stats['won']}W / {stats['lost']}L / {stats['push']}P\n"
+            f"Signals:   {stats['entries']} (traded {stats['traded']}, not traded {stats['not_traded']})\n"
+            f"Open:      {stats['open']}\n"
+            f"{clv_line}"
+            f"{blocks_line}"
+            "```"
+        ),
+        "inline": inline,
+    }
+
+
 def post_discord_summary(reason: str = "Status update") -> bool:
     webhook = getattr(config, "DISCORD_WEBHOOK_URL", "").strip()
     if not webhook:
@@ -820,6 +957,9 @@ def post_discord_summary(reason: str = "Status update") -> bool:
     manual_field = discord_manual_field(snapshot.get("manual_overall", {}), False)
     if manual_field:
         fields.append(manual_field)
+    signal_field = discord_signal_field(snapshot.get("signals_overall", {}), False)
+    if signal_field:
+        fields.append(signal_field)
     payload = {
         "username": BOT_NAME,
         "embeds": [
@@ -878,6 +1018,24 @@ def post_discord_daily_digest() -> bool:
                   f"Entries {ov['entries']} (open {ov['open']})\n```"),
         "inline": False,
     }]
+    signals_overall = signal_stats_for_period("overall")
+    if signals_overall.get("entries"):
+        signal_lines = [f"{'period':<10}{'sig':>5}{'taken':>7}{'skip':>6}{'record':>10}{'est P&L':>10}{'CLV':>8}"]
+        for label, kind in (("Today", "today"), ("Overall", "overall")):
+            s = signal_stats_for_period(kind)
+            record = f"{s['won']}W-{s['lost']}L"
+            clv = f"{s['avg_clv']:+.2%}" if s.get("clv_n") else "--"
+            code = "32" if s["paper_pnl"] > 0 else "31" if s["paper_pnl"] < 0 else "2;37"
+            signal_lines.append(
+                f"\x1b[{code}m{label:<10}{s['entries']:>5}{s['traded']:>7}{s['not_traded']:>6}"
+                f"{record:>10}{s['paper_pnl']:>+10.2f}{clv:>8}\x1b[0m"
+            )
+        fields.append({
+            "name": "Paper signals (all valid candidates; excluded from real P&L)",
+            "value": "```ansi\n" + "\n".join(signal_lines) + "\n```",
+            "inline": False,
+        })
+
     manual = manual_stats_for_period("overall")
     if manual.get("entries"):
         my = f"  yield {manual['yield']:+.1%}" if manual.get("yield") is not None else ""
@@ -1013,6 +1171,24 @@ def post_discord_clv(reason: str = "CLV update") -> bool:
         fields.append({
             "name": "Win rate vs break-even, by entry price (WR must beat brkev = avg price + fees)",
             "value": "```ansi\n" + "\n".join(pl) + "\n```",
+            "inline": False,
+        })
+
+    paper_overall = signal_stats_for_period("overall")
+    if paper_overall.get("entries"):
+        paper_lines = []
+        for label, kind in (("Today", "today"), ("Overall", "overall")):
+            s = signal_stats_for_period(kind)
+            clv = (f"{s['avg_clv']:+.2%} (n={s['clv_n']})"
+                   if s.get("clv_n") else "--")
+            paper_lines.append(
+                f"{label}: {s['entries']} signals | traded {s['traded']} | "
+                f"not traded {s['not_traded']} | {s['won']}W-{s['lost']}L | "
+                f"est P&L {s['paper_pnl']:+.2f} | CLV {clv}"
+            )
+        fields.append({
+            "name": "Paper signals (all valid candidates; excluded from real P&L)",
+            "value": "\n".join(paper_lines),
             "inline": False,
         })
 

@@ -75,6 +75,21 @@ DIVERGENCE_THRESHOLDS = {
 PRICE_FLOOR = 0.05
 PRICE_CEIL = 0.95
 
+# Every candidate that clears the model and market-quality guards in the
+# PRICE_FLOOR..PRICE_CEIL range is recorded in the paper-only signal ledger.
+# Live orders are deliberately stricter: the 5%-30% range is observed and
+# settled on paper, but never reaches the risk gate or exchange. Use the
+# ledger reports to decide later whether this live floor should move.
+LIVE_ENTRY_PRICE_FLOOR = 0.30
+LIVE_ENTRY_PRICE_CEIL = PRICE_CEIL
+TRACK_ALL_VALID_SIGNALS = True
+# Same conservative per-contract fee allowance used by the price-band report.
+# It is an estimate only; no exchange fee or balance is ever affected.
+SIGNAL_PAPER_FEE_PER_CONTRACT = 0.012
+# Public settlement is polled less often for paper signals so analytics cannot
+# add unnecessary API load to the live trading loop.
+SIGNAL_SETTLEMENT_CHECK_INTERVAL_MIN = 10
+
 # Adverse-selection guard: a divergence LARGER than this is treated as "the
 # market knows something we don't" (star scratched, lineup news, weather)
 # rather than "free money", and skipped. Sharp money moves prediction
