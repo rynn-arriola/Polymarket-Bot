@@ -125,14 +125,23 @@ python3 divergence_bot.py   # relaunch
 ```
 Non-interactively (what the assistant uses):
 ```bash
+# Count ONLY real bot processes. Do NOT use `pgrep -f divergence_bot.py`:
+# -f matches the whole command line, so it also matches the very shell running
+# this snippet (which contains the string), and reports a phantom extra bot.
+count() { ps -eo cmd | grep -c "^python3 divergence_bot\.py$" || true; }
+
 tmux send-keys -t bot C-c
-sleep 10                    # WAIT for it to actually die — see below
-pgrep -fc "[d]ivergence_bot.py"          # must be 0 before relaunching
+for i in $(seq 1 15); do [ "$(count)" = "0" ] && break; sleep 1; done
+[ "$(count)" = "0" ] || { echo "old process still alive - do NOT relaunch"; exit 1; }
 tmux send-keys -t bot "python3 divergence_bot.py" Enter
+sleep 25
+[ "$(count)" = "1" ] || echo "WRONG PROCESS COUNT - investigate before walking away"
 ```
 > **Relaunching before the old process exits gives you TWO live bots placing
-> duplicate orders.** SIGINT cleanup takes a few seconds. Always confirm the
-> process count is 0 first, and confirm it is 1 (not 2) afterwards.
+> duplicate orders.** SIGINT cleanup takes a few seconds. Confirm the count is
+> 0 before relaunching and 1 afterwards — with the `count()` above, not
+> `pgrep -f`, which lies. (A guard using `pgrep -f` once reported a phantom
+> second bot, refused to relaunch, and left the bot down for ~100 s.)
 
 After any deploy: watch the log for the startup banner and one clean
 `Cycle done`, then run the parity check.
