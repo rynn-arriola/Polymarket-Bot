@@ -61,6 +61,9 @@ def db_init():
             market_price REAL,     -- Polymarket's mid price at entry (our side)
             divergence REAL,       -- model_prob - market_price at entry
             game_start TEXT,       -- event start (UTC ISO), for closing-line capture
+            original_game_start TEXT, -- first known start before any exchange reschedule
+            rescheduled_start TEXT,   -- latest exchange-confirmed postponed start
+            rescheduled_at TEXT,      -- when the bot first/last marked it rescheduled
             is_long INTEGER,       -- 1 if we bought the long side (to price the same side at close)
             closing_price REAL,    -- market price for our side captured near game start (CLV)
             closing_captured_at TEXT,
@@ -73,6 +76,8 @@ def db_init():
     # this is a no-op on fresh installs and safe to run every startup.
     have = {r[1] for r in con.execute("PRAGMA table_info(positions)")}
     for name, decl in (("game_start", "TEXT"), ("is_long", "INTEGER"),
+                       ("original_game_start", "TEXT"), ("rescheduled_start", "TEXT"),
+                       ("rescheduled_at", "TEXT"),
                        ("closing_price", "REAL"), ("closing_captured_at", "TEXT"),
                        ("pnl_reconciled", "INTEGER DEFAULT 0")):
         if name not in have:
