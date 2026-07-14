@@ -115,6 +115,39 @@ def db_init():
             notes TEXT
         )"""
     )
+    # Paper-only ledger for every valid model signal, including signals the
+    # live risk policy declines. It must stay separate from `positions`: no
+    # signal can consume bankroll, open slots, or affect real P&L/reporting.
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS shadow_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            market_slug TEXT UNIQUE NOT NULL,
+            event_id TEXT,
+            matchup TEXT,
+            sport TEXT,
+            side TEXT,
+            price REAL NOT NULL,
+            quantity INTEGER NOT NULL,
+            stake REAL NOT NULL,
+            live INTEGER NOT NULL,
+            decision TEXT NOT NULL DEFAULT 'candidate', -- traded / not_traded / order_failed
+            decision_reason TEXT,
+            status TEXT NOT NULL DEFAULT 'open',        -- open / won / lost / push
+            model_prob REAL,
+            market_price REAL,
+            divergence REAL,
+            game_start TEXT,
+            is_long INTEGER,
+            closing_price REAL,
+            closing_captured_at TEXT,
+            settlement_price REAL,
+            estimated_fee REAL,
+            paper_pnl REAL,
+            settled_at TEXT,
+            last_settlement_check_at TEXT
+        )"""
+    )
     con.commit()
     con.close()
 

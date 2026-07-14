@@ -270,7 +270,7 @@ never guessed. Check `divergence_bot.log` periodically for
 | Max entries per sport per day | 5 |
 | Daily loss halt | 5% of day-open balance |
 | Divergence threshold | per sport, derived from each model's measured noise floor: ATP 4.5%, WTA/NBA 5%, WNBA/MLB 6.5%, FWC 8.5% — and 20% maximum (bigger = market knows something) |
-| Price guard rails | only trade in the 5%–95% price range |
+| Price guard rails | evaluate valid signals in the 5%–95% range; live orders use 30%–95%, while lower-priced valid signals are tracked on paper |
 | Entry window | final 60 minutes before start only (injury/lineup news is public by then) |
 | Key-player filter | NBA/WNBA markets skipped if a top-3 scorer is Out/Doubtful |
 | Pregame only | live/in-play games are out of scope — an Elo model has no opinion on in-game state |

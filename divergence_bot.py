@@ -141,6 +141,19 @@ def event_start_time(market: dict):
         return None
 
 
+def _stored_utc_time(value):
+    """Parse a stored ISO timestamp as aware UTC; invalid values return None."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def event_started(market: dict) -> bool:
     start = event_start_time(market)
     if start is None:
@@ -782,6 +795,66 @@ def guard_untracked_exchange_state(auth):
                          f"reconcile it manually (cancel it or add a row to positions.db).")
 
 
+def record_valid_signal(cand: dict, stake: float) -> None:
+    """Record a paper signal before price/risk/order decisions.
+
+    This ledger is deliberately independent of `positions`: a failed paper
+    write cannot block or alter a real order, and its rows never participate
+    in risk, bankroll, settlement-card, or real-P&L queries.
+    """
+    if not getattr(config, "TRACK_ALL_VALID_SIGNALS", True):
+        return
+    ask = cand["ask"]
+    quantity = int(stake // ask)
+    if quantity < 1:
+        return
+    try:
+        db(
+            """INSERT OR IGNORE INTO shadow_signals
+               (created_at, market_slug, event_id, matchup, sport, side, price,
+                quantity, stake, live, model_prob, market_price, divergence,
+                game_start, is_long)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                cand["slug"], cand.get("event_id") or cand["slug"], cand["matchup"],
+                cand["sport"], cand["team"], ask, quantity, round(quantity * ask, 2),
+                int(config.LIVE), cand["model_prob"], cand["market_price"],
+                cand["divergence"], cand.get("game_start"), cand.get("is_long"),
+            ),
+        )
+    except Exception as e:
+        # Analytics must fail open: an unavailable ledger never changes trade
+        # eligibility or order handling.
+        log.warning(f"Could not record paper signal for {cand['slug']}: {e}")
+
+
+def set_signal_decision(slug: str, decision: str, reason: str | None = None) -> None:
+    """Set the latest paper-ledger decision without ever touching positions."""
+    if not getattr(config, "TRACK_ALL_VALID_SIGNALS", True):
+        return
+    try:
+        db(
+            """UPDATE shadow_signals SET decision=?, decision_reason=?
+               WHERE market_slug=? AND decision != 'traded'""",
+            (decision, reason, slug),
+        )
+    except Exception as e:
+        log.warning(f"Could not record signal decision for {slug}: {e}")
+
+
+def live_price_reason(cand: dict) -> str | None:
+    """Live-only price policy; candidate evaluation stays wider for learning."""
+    price = cand["ask"]  # actual limit-order price, not the midpoint
+    floor = getattr(config, "LIVE_ENTRY_PRICE_FLOOR", config.PRICE_FLOOR)
+    ceiling = getattr(config, "LIVE_ENTRY_PRICE_CEIL", config.PRICE_CEIL)
+    if price < floor:
+        return f"live price policy ({price:.0%} below {floor:.0%} floor)"
+    if price > ceiling:
+        return f"live price policy ({price:.0%} above {ceiling:.0%} ceiling)"
+    return None
+
+
 def scan_once(pub, auth, engines: dict[str, EloEngine]):
     guard_untracked_exchange_state(auth)
     markets = fetch_all_markets(pub)
@@ -806,9 +879,19 @@ def scan_once(pub, auth, engines: dict[str, EloEngine]):
         # being bought (falls back to flat sizing if KELLY_FRACTION is 0).
         stake = risk.kelly_stake(effective_bankroll, cand["ask"], cand["model_prob"])
 
+        # Record every valid candidate before ANY live decision. This keeps a
+        # complete, paper-only sample of price-policy and risk-gated signals.
+        record_valid_signal(cand, stake)
+        price_reason = live_price_reason(cand)
+        if price_reason:
+            set_signal_decision(cand["slug"], "not_traded", price_reason)
+            log.info(f"paper-only {cand['slug']}: {price_reason}")
+            continue
+
         event_id = cand.get("event_id") or cand["slug"]
         reason = risk.risk_check(cand["sport"], event_id, cand["slug"], effective_bankroll, stake)
         if reason:
+            set_signal_decision(cand["slug"], "not_traded", reason)
             log.info(f"skip {cand['slug']}: {reason}")
             continue
 
@@ -823,11 +906,13 @@ def scan_once(pub, auth, engines: dict[str, EloEngine]):
             )
         except Exception as e:
             if not config.LIVE:
+                set_signal_decision(cand["slug"], "order_failed", "dry-run order simulation failed")
                 log.warning(f"dry-run order simulation failed for {cand['slug']}: {e}")
                 continue
             if isinstance(e, BadRequestError):
                 # A clean 400 is a definitive rejection — the order does not
                 # exist on the exchange. Safe to skip without blocking.
+                set_signal_decision(cand["slug"], "order_failed", "exchange order rejected")
                 log.warning(f"order rejected (400) for {cand['slug']}: {e} — nothing placed")
                 continue
             # Ambiguous failure — the order MAY be live. Block first, verify second.
@@ -835,12 +920,14 @@ def scan_once(pub, auth, engines: dict[str, EloEngine]):
             try:
                 recovered = _recover_order(auth, cand["slug"], int(stake // cand["ask"]))
             except Exception as verify_err:
+                set_signal_decision(cand["slug"], "order_unknown", "ambiguous exchange order state")
                 log.critical(f"POSSIBLE UNTRACKED LIVE ORDER on {cand['slug']}: create raised "
                              f"({e}) and verification also failed ({verify_err}). Blocking this "
                              f"market for this run — CHECK THE APP/EXCHANGE MANUALLY.")
                 continue
             if recovered is None:
                 risk._UNTRACKED_SLUGS_THIS_RUN.discard(cand["slug"])
+                set_signal_decision(cand["slug"], "order_failed", "exchange order create failed")
                 log.warning(f"order create failed for {cand['slug']} ({e}) — verified NOT on "
                             f"the exchange, safe to retry next cycle")
                 continue
@@ -880,6 +967,10 @@ def scan_once(pub, auth, engines: dict[str, EloEngine]):
                 if attempt < 2:
                     time.sleep(1)
         if not inserted:
+            set_signal_decision(
+                cand["slug"], "order_unknown" if config.LIVE else "order_failed",
+                "position record failed after order" if config.LIVE else "dry-run position record failed",
+            )
             risk._UNTRACKED_SLUGS_THIS_RUN.add(cand["slug"])
             if config.LIVE:
                 log.critical(f"UNTRACKED LIVE ORDER: order {order_id} on {cand['slug']} was SENT "
@@ -890,6 +981,7 @@ def scan_once(pub, auth, engines: dict[str, EloEngine]):
                             f"blocking re-entry this run")
             continue
 
+        set_signal_decision(cand["slug"], "traded")
         log.info(f"ENTERED {cand['team']} ({cand['side']}) @ {cand['ask']:.2f} stake ${stake:.2f} "
                  f"({cand['sport']}) model={cand['model_prob']:.1%} market={cand['market_price']:.1%} "
                  f"divergence={cand['divergence']:+.1%} [{'LIVE' if config.LIVE else 'DRY'}]")
@@ -1188,6 +1280,127 @@ def capture_closing_lines(pub):
             log.info(f"CLV close {mid:.3f} captured for {slug}")
 
 
+def capture_signal_closing_lines(pub):
+    """Capture CLV for paper signals without involving real positions."""
+    if not getattr(config, "TRACK_ALL_VALID_SIGNALS", True):
+        return
+    now = datetime.now(timezone.utc)
+    window = timedelta(minutes=getattr(config, "CLOSING_CAPTURE_MINUTES", 5))
+    rows = db(
+        """SELECT id, market_slug, game_start, is_long, closing_price
+           FROM shadow_signals WHERE status='open' AND game_start IS NOT NULL""",
+        fetch=True,
+    )
+    for sid, slug, gstart, is_long, existing in rows:
+        start = _stored_utc_time(gstart)
+        if start is None:
+            continue
+        in_window = start - window <= now <= start
+        fallback = existing is None and start < now <= start + timedelta(minutes=30)
+        if not (in_window or fallback):
+            continue
+        mid = _market_mid(pub, slug, bool(is_long))
+        if mid is not None:
+            db("UPDATE shadow_signals SET closing_price=?, closing_captured_at=? WHERE id=?",
+               (mid, now.isoformat(), sid))
+            log.info(f"Paper-signal CLV close {mid:.3f} captured for {slug}")
+
+
+def _refresh_rescheduled_signal_start(client, sid: int, slug: str,
+                                      current_start: datetime | None,
+                                      now: datetime) -> bool:
+    """Move a paper signal to a later exchange-confirmed start, if present."""
+    try:
+        resp = client.markets.retrieve_by_slug(slug)
+        market = resp.get("market", resp) if isinstance(resp, dict) else {}
+    except Exception:
+        return False
+    new_start = event_start_time(market)
+    if new_start is None or new_start <= now:
+        return False
+    if current_start is not None and new_start <= current_start:
+        return False
+    db(
+        """UPDATE shadow_signals
+           SET game_start=?, closing_price=NULL, closing_captured_at=NULL
+           WHERE id=?""",
+        (new_start.isoformat(), sid),
+    )
+    log.info(f"Paper signal {slug} rescheduled to {new_start.isoformat()[:16]}")
+    return True
+
+
+def check_signal_settlements(client) -> int:
+    """Settle paper signals from public market data, never account activity.
+
+    `paper_pnl` is an estimated result using the configured per-contract fee,
+    so it is intentionally separate from the exchange-exact P&L in positions.
+    """
+    if not getattr(config, "TRACK_ALL_VALID_SIGNALS", True):
+        return 0
+    now = datetime.now(timezone.utc)
+    interval = timedelta(minutes=getattr(config, "SIGNAL_SETTLEMENT_CHECK_INTERVAL_MIN", 10))
+    rows = db(
+        """SELECT id, market_slug, price, quantity, is_long, game_start, last_settlement_check_at
+           FROM shadow_signals WHERE status='open'""",
+        fetch=True,
+    )
+    settled = 0
+    for sid, slug, price, quantity, is_long, game_start, checked_at in rows:
+        start = _stored_utc_time(game_start)
+        if start is not None and start > now:
+            continue
+        last_checked = _stored_utc_time(checked_at)
+        if last_checked is not None and now - last_checked < interval:
+            continue
+        try:
+            settlement = client.markets.settlement(slug)
+        except Exception:
+            _refresh_rescheduled_signal_start(client, sid, slug, start, now)
+            db("UPDATE shadow_signals SET last_settlement_check_at=? WHERE id=?",
+               (now.isoformat(), sid))
+            continue
+        if not settlement:
+            _refresh_rescheduled_signal_start(client, sid, slug, start, now)
+            db("UPDATE shadow_signals SET last_settlement_check_at=? WHERE id=?",
+               (now.isoformat(), sid))
+            continue
+        settle_price = None
+        if isinstance(settlement, dict):
+            for key in ("settlement", "settlementPrice", "price", "value"):
+                value = settlement.get(key)
+                if isinstance(value, dict):
+                    value = value.get("value")
+                if value is not None:
+                    try:
+                        settle_price = float(value)
+                        break
+                    except (TypeError, ValueError):
+                        pass
+        if settle_price is None:
+            log.warning(f"Unrecognized paper-signal settlement format for {slug}")
+            db("UPDATE shadow_signals SET last_settlement_check_at=? WHERE id=?",
+               (now.isoformat(), sid))
+            continue
+        long_side = is_long is None or bool(is_long)
+        payout = settle_price if long_side else (1.0 - settle_price)
+        gross_pnl = quantity * (payout - price)
+        fee = quantity * getattr(config, "SIGNAL_PAPER_FEE_PER_CONTRACT", 0.012)
+        paper_pnl = round(gross_pnl - fee, 2)
+        status = "won" if gross_pnl > 0 else ("lost" if gross_pnl < 0 else "push")
+        db(
+            """UPDATE shadow_signals
+               SET status=?, settlement_price=?, estimated_fee=?, paper_pnl=?,
+                   settled_at=?, last_settlement_check_at=?
+               WHERE id=?""",
+            (status, settle_price, round(fee, 2), paper_pnl,
+             now.isoformat(), now.isoformat(), sid),
+        )
+        settled += 1
+        log.info(f"PAPER SIGNAL SETTLED {status.upper()} {slug}  estimated P&L {paper_pnl:+.2f}")
+    return settled
+
+
 _STUCK_SETTLEMENT_WARNED: dict = {}  # pid -> monotonic time of last "stuck" warning
 
 
@@ -1461,9 +1674,11 @@ def cmd_run():
             scan_once(pub, auth, engines)
             confirm_fills(auth)
             capture_closing_lines(pub)
+            capture_signal_closing_lines(pub)
             cancel_stale_orders(auth)
             mark_rescheduled_positions(pub)
             settled_ids = check_settlements(pub, auth if config.LIVE else None)
+            check_signal_settlements(pub)
             if config.LIVE:
                 reconcile_live_pnl(auth)
             if settled_ids:
