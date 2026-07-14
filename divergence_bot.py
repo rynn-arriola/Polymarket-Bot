@@ -1079,11 +1079,11 @@ def confirm_fills(client):
     if not config.LIVE:
         db("UPDATE positions SET status='open' WHERE status='pending' AND live=0")
         return
-    rows = db("SELECT id, market_slug, order_id, price, quantity FROM positions "
+    rows = db("SELECT id, market_slug, order_id, price, quantity, created_at FROM positions "
               "WHERE status='pending' AND live=1", fetch=True)
     if not rows:
         return
-    for pid, slug, order_id, price, quantity in rows:
+    for pid, slug, order_id, price, quantity, created_at in rows:
         st = _order_state(client, order_id)
         if isinstance(st, tuple):
             state, filled = st
@@ -1114,6 +1114,23 @@ def confirm_fills(client):
             _mark_open(pid, slug, price, quantity,
                        min(_as_int(qty), _as_int(quantity)) or _as_int(quantity))
         elif st == "NOT_FOUND":
+            # NOT_FOUND right after placement usually means the exchange's
+            # read path hasn't indexed the order yet, NOT that it's gone:
+            # confirm_fills runs in the same cycle as placement, and three
+            # orders checked <1s in were mis-cancelled this way on
+            # 2026-07-14 (they filled, resolved, and never hit reporting).
+            # Within the grace window, leave the row pending and re-check
+            # next cycle; a genuinely dead order is cancelled once older.
+            try:
+                age_min = (datetime.now(timezone.utc)
+                           - datetime.fromisoformat(created_at)).total_seconds() / 60
+            except (TypeError, ValueError):
+                age_min = None
+            grace = getattr(config, "ORDER_VISIBILITY_GRACE_MIN", 5)
+            if age_min is not None and age_min < grace:
+                log.info(f"Order {order_id} on {slug} not visible yet "
+                         f"({age_min:.1f} min old) — waiting for exchange read path")
+                continue
             db("UPDATE positions SET status='cancelled' WHERE id=?", (pid,))
             log.info(f"Order {order_id} on {slug} not found on the exchange and no position "
                      f"held — marked cancelled")
