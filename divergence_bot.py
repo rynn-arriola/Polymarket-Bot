@@ -1079,11 +1079,11 @@ def confirm_fills(client):
     if not config.LIVE:
         db("UPDATE positions SET status='open' WHERE status='pending' AND live=0")
         return
-    rows = db("SELECT id, market_slug, order_id, price, quantity, created_at FROM positions "
+    rows = db("SELECT id, market_slug, order_id, price, quantity FROM positions "
               "WHERE status='pending' AND live=1", fetch=True)
     if not rows:
         return
-    for pid, slug, order_id, price, quantity, created_at in rows:
+    for pid, slug, order_id, price, quantity in rows:
         st = _order_state(client, order_id)
         if isinstance(st, tuple):
             state, filled = st
@@ -1100,40 +1100,20 @@ def confirm_fills(client):
             # NEW / PARTIALLY_FILLED / PENDING_* -> still working, stays pending
             # (cancel_stale_orders resolves it at the CANCEL_UNFILLED_AFTER_MIN mark).
             continue
-        # st is "NOT_FOUND" (definitively gone) or None (transient failure).
-        # Either way, ask the portfolio about THIS market specifically — the
-        # per-market filter can't be fooled by pagination the way the full
-        # listing was. Only NOT_FOUND cancels an absent row — a transient
-        # failure leaves it pending to retry (a blip can't wrongly cancel a
-        # live resting order), and an inconclusive lookup (None) never
-        # decides anything.
+        # st is "NOT_FOUND" or None (transient failure). Ask the portfolio
+        # about THIS market specifically — the per-market filter can't be
+        # fooled by pagination the way the full listing was. A visible
+        # position confirms the fill; anything else leaves the row pending.
+        # Absence NEVER cancels here — not even NOT_FOUND: a just-placed
+        # order can be invisible to the exchange's read path for a moment
+        # (three orders were mis-cancelled <1s after placement on 2026-07-14,
+        # then filled and resolved unseen). Giving up on an order is solely
+        # cancel_stale_orders' job: it waits CANCEL_UNFILLED_AFTER_MIN and
+        # issues a definitive cancel before concluding anything.
         qty = _position_quantity(client, slug)
-        if qty is None:
-            continue  # lookup failed — retry next cycle
-        if qty > 0:
+        if qty is not None and qty > 0:
             _mark_open(pid, slug, price, quantity,
                        min(_as_int(qty), _as_int(quantity)) or _as_int(quantity))
-        elif st == "NOT_FOUND":
-            # NOT_FOUND right after placement usually means the exchange's
-            # read path hasn't indexed the order yet, NOT that it's gone:
-            # confirm_fills runs in the same cycle as placement, and three
-            # orders checked <1s in were mis-cancelled this way on
-            # 2026-07-14 (they filled, resolved, and never hit reporting).
-            # Within the grace window, leave the row pending and re-check
-            # next cycle; a genuinely dead order is cancelled once older.
-            try:
-                age_min = (datetime.now(timezone.utc)
-                           - datetime.fromisoformat(created_at)).total_seconds() / 60
-            except (TypeError, ValueError):
-                age_min = None
-            grace = getattr(config, "ORDER_VISIBILITY_GRACE_MIN", 5)
-            if age_min is not None and age_min < grace:
-                log.info(f"Order {order_id} on {slug} not visible yet "
-                         f"({age_min:.1f} min old) — waiting for exchange read path")
-                continue
-            db("UPDATE positions SET status='cancelled' WHERE id=?", (pid,))
-            log.info(f"Order {order_id} on {slug} not found on the exchange and no position "
-                     f"held — marked cancelled")
 
 
 def cancel_stale_orders(client):
@@ -1154,6 +1134,14 @@ def cancel_stale_orders(client):
             # CancelOrderParams requires the market slug (SDK 0.1.2) — a
             # single-arg cancel raises TypeError and never cancels.
             client.orders.cancel(order_id, {"marketSlug": slug})
+        except NotFoundError:
+            # The exchange doesn't know this order (sync reject, or already
+            # purged). At CANCEL_UNFILLED_AFTER_MIN old that's definitive —
+            # read-path lag is a seconds-scale phenomenon — so fall through
+            # to the fill checks below and resolve the row. Without this,
+            # a never-rested order would stay pending forever, since
+            # confirm_fills deliberately never cancels on absence.
+            pass
         except Exception as e:
             log.warning(f"Cancel failed for {slug}: {e}")
             continue
@@ -1201,9 +1189,9 @@ def verify_cancelled_rows(auth):
       - neither                    -> genuinely cancelled; flag verified so
                                       the row is never checked again
 
-    Checks wait until the row is ORDER_VISIBILITY_GRACE_MIN old (same
-    read-path-lag reasoning as confirm_fills), and each row is verified at
-    most once, so the steady-state API cost is zero. Known blind spot: a
+    Checks wait until the row is a few minutes old so the exchange's read
+    path has certainly indexed any fill, and each row is verified at most
+    once, so the steady-state API cost is zero. Known blind spot: a
     MANUAL position on the same market would make a correctly-cancelled bot
     row look filled — acceptable; the loud ops log makes any heal visible.
     """
@@ -1214,7 +1202,7 @@ def verify_cancelled_rows(auth):
         "WHERE live=1 AND status='cancelled' AND COALESCE(cancel_verified,0)=0",
         fetch=True,
     )
-    grace = getattr(config, "ORDER_VISIBILITY_GRACE_MIN", 5)
+    grace = 5  # minutes; read-path lag is seconds-scale, this is ample
     for pid, slug, price, quantity, created_at in rows:
         try:
             age_min = (datetime.now(timezone.utc)
