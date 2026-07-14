@@ -306,6 +306,12 @@ REPORT_TIMEZONE = "America/New_York"
 # --- Timing ---
 SCAN_INTERVAL_SECONDS = 60
 CANCEL_UNFILLED_AFTER_MIN = 10
+# A just-placed order is NOT immediately visible on the exchange's read
+# endpoints: on 2026-07-14 three orders checked <1s after placement came
+# back NOT_FOUND (order AND portfolio), were marked cancelled, then filled
+# and resolved on the exchange — invisible to reporting. NOT_FOUND is only
+# trusted as "definitively gone" once the order is at least this old.
+ORDER_VISIBILITY_GRACE_MIN = 5
 
 # --- Rescheduled-match hold marker ---
 # A filled position whose match gets POSTPONED stays open so we don't pay an
