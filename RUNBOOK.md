@@ -46,6 +46,40 @@ Paste the ENTIRE output to Claude → we make at most ONE config change.
 
 ---
 
+## MANUAL TRADE TRACKING
+
+Manual bets live in a separate `manual_trades` table inside `positions.db`.
+They are not placed, cancelled, settled, or reconciled by the bot loop.
+Closing/cashing out/cancelling one posts a manual card to the settlement
+webhook and refreshes the status webhook when those webhooks are configured.
+Manual totals also appear as separate blocks in status/daily/CLV reporting.
+
+```bash
+# Add a manually placed bet
+python3 manual_trades.py add --slug <market-slug> --sport CS2 \
+  --matchup "Team A vs Team B" --side "Team A" --price 0.42 --quantity 10
+
+# Mark a manual bet cashed out
+python3 manual_trades.py cashout <id> --close-price 0.55
+
+# Mark a manual bet by final result
+python3 manual_trades.py close <id> --status won
+python3 manual_trades.py close <id> --status lost
+
+# Cancel a manual order that never filled
+python3 manual_trades.py cancel <id>
+
+# Review manual bets
+python3 manual_trades.py list
+python3 manual_trades.py report
+```
+
+Manual tracking is for human-entered trades only. Bot-entered live positions
+stay in the normal `positions` table and continue to settle/reconcile through
+the exchange flow.
+
+---
+
 ## DEPLOYING (when Claude hands you files)
 
 ```powershell

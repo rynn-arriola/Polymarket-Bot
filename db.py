@@ -83,6 +83,33 @@ def db_init():
             open_balance REAL
         )"""
     )
+    # Separate ledger for bets entered outside the bot. This intentionally
+    # does not reuse `positions`: bot accounting has a unique market_slug
+    # guard and exchange-driven settlement flow, while manual tracking needs
+    # to allow cashouts, cancelled orders, and multiple human-entered bets on
+    # the same market without affecting the live bot's duplicate guards.
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS manual_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            market_slug TEXT,
+            matchup TEXT,
+            sport TEXT,
+            side TEXT,
+            price REAL,
+            quantity REAL,
+            stake REAL,
+            live INTEGER DEFAULT 1,
+            order_id TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            closed_at TEXT,
+            close_price REAL,
+            pnl REAL,
+            close_reason TEXT,
+            notes TEXT
+        )"""
+    )
     con.commit()
     con.close()
 
