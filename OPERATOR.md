@@ -52,8 +52,8 @@ a DigitalOcean droplet. Every change you make can lose money.
    than yours*. (Unlike `positions.db`, these do self-heal on the next
    refresh if clobbered — but don't.)
 4. **Never hand-edit code on the server.** Changes flow
-   `local → branch → verify → main → deploy`. A server hand-edit is silently
-   destroyed by the next deploy, and makes main a lie.
+   `local → branch → verify → main → deploy → push`. A server hand-edit is
+   silently destroyed by the next deploy, and makes main a lie.
 5. **Every change gets its own branch off main.** Never commit directly to
    main. See [the working agreement](#3-working-agreement-how-changes-get-made).
 6. **One strategy change per week**, decided from the edge report. Changing
@@ -89,6 +89,22 @@ real-money incident (see [History](#11-history-incidents-and-what-they-taught)).
 7. **Deploy to the server, and confirm main == server.** Main and the server
    must never disagree. Run the [parity check](#parity-check-main-vs-server)
    after every deploy.
+8. **Push to GitHub.** `git push origin main` — only once the change is
+   verified, merged, deployed, and parity is clean. Nothing is "done" until
+   it's pushed: an unpushed commit lives on one Windows machine and is one disk
+   failure from gone. The repo is **private**
+   (`github.com/rynn-arriola/Polymarket-Bot`).
+
+   > **Before the first push of anything new, check for secrets.** Real keys,
+   > tokens, and webhook URLs live in `credentials.py`, which is **gitignored**.
+   > `config.py` IS tracked but holds only `_secret("NAME")` lookups — never a
+   > literal value. Keep it that way: a secret pushed to GitHub is not undone by
+   > deleting it, it's undone by rotating the key.
+
+**The finish line for any change is: verified → merged → deployed → parity
+clean → pushed.** Stopping short of that leaves the four copies of this project
+(working tree, main, server, GitHub) disagreeing, and the whole point of the
+workflow is that they never do.
 
 ---
 
