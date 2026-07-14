@@ -203,7 +203,7 @@ fresher. `credentials.example.py` is expected to be absent on the server.
 
 ### DAILY (~2 min)
 
-**1. Pull the server's state down.**
+**1. Pull the server's state down and audit reporting.**
 ```bash
 python pull_server_state.py    # local, from the repo
 ```
@@ -223,6 +223,11 @@ snapshot on the server (safe while the bot is writing — the DB is in WAL mode,
 so a plain `scp` of the file could catch a torn write) and copies *down*. It
 never writes to `/root/divergence-bot`. A corrupt or interrupted download is
 verified and rejected *before* it can replace the last good backup.
+
+After the pull, it runs `audit_reporting.py` on the server against the live DB
+and exchange API. Expect `CLEAN — reporting inputs are consistent`. If the
+audit flags anything or the command fails, the backup is still valid; paste
+the full audit output before making changes.
 
 Your local `positions.db` is the **dry-run/dev** database (`live=0`) and is
 **never touched** — the live DB lands in `server_mirror/`, kept separate so the

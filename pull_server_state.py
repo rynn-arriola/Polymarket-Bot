@@ -12,10 +12,11 @@ Two jobs:
 
 ## This script CANNOT write to the server. That is the point.
 
-It runs exactly two remote commands: a read-only `sqlite3 .backup` into /tmp,
-and the cleanup of that temp file. Everything else is `scp` in the
-server -> local direction. It never writes to /root/divergence-bot, and it must
-never be "extended" to. Local is downstream of the server, always:
+It runs only read-only remote commands: a `sqlite3 .backup` into /tmp and the
+reporting-integrity audit, plus cleanup of that temporary snapshot. Everything
+else is `scp` in the server -> local direction. It never writes to
+/root/divergence-bot, and it must never be "extended" to. Local is downstream
+of the server, always:
 
     server  --->  local        OK, this script
     local   --->  server       NEVER for positions.db or generated data
@@ -121,6 +122,24 @@ def pull_generated() -> None:
         print(f"  ok: {name} ({dest.stat().st_size:,} bytes)")
 
 
+def audit_reporting() -> int:
+    """Run the server-side, read-only reporting audit and preserve its output."""
+    print("\nreporting-integrity audit (live DB + exchange)")
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, SERVER,
+         f"cd {REMOTE_DIR} && python3 audit_reporting.py"],
+        capture_output=True,
+        text=True,
+    )
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.stderr:
+        print(result.stderr.rstrip(), file=sys.stderr)
+    if result.returncode:
+        print(f"  FAILED: audit exited {result.returncode}; backup remains valid")
+    return result.returncode
+
+
 def prune() -> None:
     snaps = sorted(SNAPSHOTS.glob("positions_*.db"))
     for old in snaps[:-KEEP_SNAPSHOTS]:
@@ -136,9 +155,10 @@ def main() -> int:
     pull_db()
     pull_generated()
     prune()
+    audit_exit = audit_reporting()
     print(f"\ndone. Live DB mirrored to {MIRROR.name}/positions.db - this is a "
           f"BACKUP, not an input.\nLocal positions.db (dry-run) was not touched.")
-    return 0
+    return audit_exit
 
 
 if __name__ == "__main__":
