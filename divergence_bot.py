@@ -1222,7 +1222,7 @@ def verify_cancelled_rows(auth):
                         f"exchange holds {qty:.0f} contract(s) — restored to open")
             continue
         res = _resolution_pnl(auth, slug)
-        if res is not None:
+        if isinstance(res, tuple):
             pnl, stable = res
             status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
             db("UPDATE positions SET status=?, pnl=?, settled_at=?, "
@@ -1233,7 +1233,10 @@ def verify_cancelled_rows(auth):
                         f"resolved on the exchange — settled {status.upper()} "
                         f"P&L {pnl:+.2f}")
             continue
-        # Exchange agrees: no position, no resolution — genuinely cancelled.
+        if res is RESOLUTION_CHECK_FAILED:
+            continue  # couldn't check — retry next cycle, conclude NOTHING
+        # res is None: the feed answered — no position, no resolution.
+        # Only this definitive answer marks the cancel verified.
         db("UPDATE positions SET cancel_verified=1 WHERE id=?", (pid,))
     return
 
@@ -1468,10 +1471,20 @@ def check_signal_settlements(client) -> int:
 _STUCK_SETTLEMENT_WARNED: dict = {}  # pid -> monotonic time of last "stuck" warning
 
 
-def _resolution_pnl(auth, slug: str) -> tuple[float, bool] | None:
+# Sentinel: the resolution check itself FAILED (feed down, rate-limited,
+# unrecognized shape). Distinct from None = the feed answered and there is
+# definitively no resolution. verify_cancelled_rows marked a mis-cancelled
+# row (ica-dnt, 2026-07-14) verified-forever off one transient failure
+# because the two cases were conflated — callers must retry on this value
+# and never conclude anything from it.
+RESOLUTION_CHECK_FAILED = object()
+
+
+def _resolution_pnl(auth, slug: str):
     """(P&L, stable) from the account's POSITION_RESOLUTION activity for this
-    market, or None if the exchange hasn't resolved it (or the feed is
-    unavailable — callers fall back to the public settlement endpoint).
+    market; None when the feed answered and shows NO resolution (definitive);
+    RESOLUTION_CHECK_FAILED when the check itself failed — retry later.
+    Callers should branch with isinstance(res, tuple) for the settled case.
 
     `stable` is False while the activity is younger than
     RESOLUTION_STABLE_MINUTES: the exchange RESTATES the cost basis (rolls
@@ -1491,10 +1504,12 @@ def _resolution_pnl(auth, slug: str) -> tuple[float, bool] | None:
         })
     except Exception as e:
         log.warning(f"Resolution-activity check failed for {slug}: {e}")
+        return RESOLUTION_CHECK_FAILED
+    if not isinstance(resp, dict) or "activities" not in resp:
+        return RESOLUTION_CHECK_FAILED  # unexpected shape is NOT an empty feed
+    if not resp["activities"]:
         return None
-    activities = resp.get("activities") if isinstance(resp, dict) else None
-    if not activities:
-        return None
+    activities = resp["activities"]
     pr = activities[0].get("positionResolution") or {}
     before = pr.get("beforePosition") or {}
     try:
@@ -1502,7 +1517,7 @@ def _resolution_pnl(auth, slug: str) -> tuple[float, bool] | None:
         cash_value = float((before.get("cashValue") or {}).get("value"))
     except (TypeError, ValueError):
         log.warning(f"Unrecognized resolution activity format for {slug}")
-        return None
+        return RESOLUTION_CHECK_FAILED
     stable = True  # unknown age -> assume stable (pre-updateTime API shapes)
     raw_ts = pr.get("updateTime") or activities[0].get("updateTime")
     if raw_ts:
@@ -1532,7 +1547,7 @@ def check_settlements(client, auth=None):
         # an estimate that reconcile_live_pnl corrects later.
         if live and auth is not None:
             res = _resolution_pnl(auth, slug)
-            if res is not None:
+            if isinstance(res, tuple):
                 pnl, stable = res
                 status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
                 # Settle NOW (Discord shouldn't wait), but only stamp the P&L
@@ -1615,8 +1630,8 @@ def reconcile_live_pnl(client):
     )
     for pid, slug in rows:
         res = _resolution_pnl(client, slug)
-        if res is None:
-            continue  # not posted yet / feed unavailable — retry next cycle
+        if not isinstance(res, tuple):
+            continue  # not posted yet / check failed — retry next cycle
         real_pnl, stable = res
         if not stable:
             # The exchange restates cost basis (fees) shortly after posting
