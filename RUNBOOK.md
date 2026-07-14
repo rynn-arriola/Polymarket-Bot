@@ -165,6 +165,12 @@ working. New entries halt until midnight ET; open positions still settle.
 - P&L reconciliation to exchange-exact figures: within ~1h of each settlement
 - Ratings/data refresh: every 6h (hot-reload, no restart)
 - CLV capture: final minutes before every game start
+- Valid-signal ledger: every candidate that clears the model, timing, liquidity,
+  spread, roster, and divergence guards is recorded before price/risk/order
+  decisions. The paper-only ledger captures CLV and settlement for candidates
+  rejected by the 30% live price floor, daily loss brake, open-position cap,
+  sport cap, or other order gate; it never changes real P&L, bankroll, slots,
+  or settlement cards.
 - Rescheduled matches: once a position is 2h past its original start AND the
   exchange has moved the start into the future, it stays open to avoid exit
   fees. The bot marks it rescheduled, updates the new start for CLV, and adds
