@@ -225,7 +225,7 @@ def probability(engine: EloEngine, player_a: str, player_b: str,
 # ------------------------------------------------------------------
 # ITF fallback: local CSVs (Sackmann schema). ESPN has no ITF endpoint and
 # the classic public source (JeffSackmann/tennis_itf on GitHub) was
-# unreachable when this was built — see README.md.
+# unreachable when this was built — see OPERATOR.md.
 # ------------------------------------------------------------------
 
 def _iter_csv_matches(csv_dir: Path) -> list[tuple[str, str, str]]:
@@ -248,7 +248,7 @@ def build_engine_csv(csv_dir: str | Path) -> tuple[EloEngine, int]:
     p = params.get("itf")
     engine = EloEngine(k_factor=p["k"])
     if not csv_dir.is_dir():
-        log.warning(f"Tennis data directory not found: {csv_dir} — see README.md for setup")
+        log.warning(f"Tennis data directory not found: {csv_dir} — see OPERATOR.md for setup")
         return engine, 0
     total = 0
     for _d, winner, loser in _iter_csv_matches(csv_dir):

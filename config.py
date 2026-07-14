@@ -370,7 +370,7 @@ TENNIS_START_DATE = date(2019, 1, 1)
 TENNIS_TML_START_YEAR = 2019
 
 # --- ITF tennis data (fallback only — ESPN doesn't cover ITF) ---
-# See README.md: ESPN has no ITF endpoint, and Jeff Sackmann's public
+# See OPERATOR.md: ESPN has no ITF endpoint, and Jeff Sackmann's public
 # ITF match-history CSVs were unreachable when this was built — place
 # current CSVs (tourney_date/winner_name/loser_name columns, one row per
 # match) in data/tennis/itf/ if you find a source, otherwise ITF markets
