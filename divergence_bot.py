@@ -1076,51 +1076,37 @@ def cancel_stale_orders(client):
             log.info(f"Cancelled unfilled order on {slug} after {age_min:.0f} min")
 
 
-def _execution_proceeds(resp) -> tuple[float | None, int]:
-    """(total cash proceeds, shares) from a close/create order response's
-    executions, or (None, 0) if the fills can't be parsed."""
-    try:
-        execs = (resp or {}).get("executions") or []
-        total, shares = 0.0, 0
-        for e in execs:
-            n = float(e.get("lastShares") or 0)
-            px = float(((e.get("lastPx") or {}).get("value")) or 0)
-            total += n * px
-            shares += int(n)
-        return (round(total, 2), shares) if shares else (None, 0)
-    except (TypeError, ValueError):
-        return None, 0
-
-
-def exit_rescheduled_positions(pub, auth) -> list[int]:
-    """Close LIVE open positions whose match the exchange has RESCHEDULED.
+def mark_rescheduled_positions(pub) -> int:
+    """Mark LIVE open positions whose match the exchange has RESCHEDULED.
 
     The trigger is deliberately NOT elapsed time: once a position is
-    RESCHEDULE_EXIT_AFTER_HOURS past its ORIGINAL start, we re-read the
+    RESCHEDULE_MARK_AFTER_HOURS past its ORIGINAL start, we re-read the
     market's own gameStartTime. Only a start moved INTO THE FUTURE — the
-    exchange's own word that the match was postponed — triggers an exit; a
+    exchange's own word that the match was postponed — triggers a mark; a
     long game keeps its past start time and is always left alone, and a
     short delay is already in the past by the time we look. The entry
-    premise (priced an hour before a match that now plays days later, with
-    lineups/meta free to change meanwhile) doesn't survive a postponement,
-    and the capital + open-slot are better freed.
+    stays open to avoid paying an early-exit fee. The risk gate gives each
+    marked open position one extra slot, so a postponed match does not block
+    the normal MAX_OPEN_POSITIONS budget.
 
-    Booked from the actual close fills (proceeds - stake), pnl_reconciled=1
-    (no resolution activity will ever exist for an early-closed position).
-    Fail-open everywhere: market lookup or close failure -> retry next
-    cycle. Positions whose rescheduled market carries NO date yet (TBD) are
-    left alone until the exchange sets one. Dry-run positions are skipped
-    (nothing real to close)."""
-    hours = getattr(config, "RESCHEDULE_EXIT_AFTER_HOURS", 0)
+    `game_start` is updated to the exchange's new start so closing-line capture
+    still runs near the actual game. `original_game_start` preserves the first
+    start we bought against. Fail-open everywhere: lookup/update failure ->
+    retry next cycle. Positions whose rescheduled market carries NO date yet
+    (TBD) are left alone until the exchange sets one. Dry-run positions are
+    skipped (nothing real to protect from fees)."""
+    hours = getattr(config, "RESCHEDULE_MARK_AFTER_HOURS",
+                    getattr(config, "RESCHEDULE_EXIT_AFTER_HOURS", 0))
     if not hours or not config.LIVE:
-        return []
+        return 0
     now = datetime.now(timezone.utc)
-    rows = db("SELECT id, market_slug, price, quantity, stake, game_start FROM positions "
+    rows = db("SELECT id, market_slug, game_start, original_game_start, rescheduled_start "
+              "FROM positions "
               "WHERE live=1 AND status='open' AND game_start IS NOT NULL", fetch=True)
-    exited = []
-    for pid, slug, price, quantity, stake, gstart in rows:
+    marked = 0
+    for pid, slug, gstart, original_start, old_rescheduled_start in rows:
         try:
-            start = datetime.fromisoformat(gstart)
+            start = datetime.fromisoformat(original_start or gstart)
         except (TypeError, ValueError):
             continue
         if now < start + timedelta(hours=hours):
@@ -1134,27 +1120,20 @@ def exit_rescheduled_positions(pub, auth) -> list[int]:
         new_start = event_start_time(market)
         if new_start is None or new_start <= now:
             continue  # still in the past (long game) or TBD — leave alone
-        try:
-            r = auth.orders.close_position({"marketSlug": slug})
-        except Exception as e:
-            log.warning(f"RESCHEDULED {slug} (new start {new_start.isoformat()[:16]}) but "
-                        f"close failed: {e} — will retry next cycle")
+        new_start_iso = new_start.isoformat()
+        if old_rescheduled_start == new_start_iso:
             continue
-        proceeds, shares = _execution_proceeds(r)
-        cost = stake if stake is not None else (quantity or 0) * (price or 0)
-        if proceeds is None:
-            pnl = 0.0
-            log.warning(f"RESCHEDULE EXIT {slug}: close fills unparseable — booking flat; "
-                        f"verify actual P&L in the app (raw: {str(r)[:200]})")
-        else:
-            pnl = round(proceeds - cost, 2)
-        status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
-        db("UPDATE positions SET status=?, pnl=?, settled_at=?, pnl_reconciled=1 WHERE id=?",
-           (status, pnl, now.isoformat(), pid))
-        exited.append(pid)
-        log.warning(f"RESCHEDULE EXIT {slug}: match moved to {new_start.isoformat()[:16]} — "
-                    f"closed {shares or '?'} contract(s) at market, P&L {pnl:+.2f}")
-    return exited
+        db("""UPDATE positions
+              SET original_game_start=COALESCE(original_game_start, game_start),
+                  game_start=?,
+                  rescheduled_start=?,
+                  rescheduled_at=?
+              WHERE id=?""",
+           (new_start_iso, new_start_iso, now.isoformat(), pid))
+        marked += 1
+        log.warning(f"RESCHEDULED {slug}: match moved to {new_start.isoformat()[:16]} — "
+                    f"keeping position open; open-position cap gets one extra slot")
+    return marked
 
 
 def _market_mid(pub, slug: str, is_long: bool) -> float | None:
@@ -1477,8 +1456,8 @@ def cmd_run():
             confirm_fills(auth)
             capture_closing_lines(pub)
             cancel_stale_orders(auth)
-            rescheduled_ids = exit_rescheduled_positions(pub, auth)
-            settled_ids = rescheduled_ids + check_settlements(pub, auth if config.LIVE else None)
+            mark_rescheduled_positions(pub)
+            settled_ids = check_settlements(pub, auth if config.LIVE else None)
             if config.LIVE:
                 reconcile_live_pnl(auth)
             if settled_ids:
