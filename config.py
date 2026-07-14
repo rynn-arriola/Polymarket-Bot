@@ -274,6 +274,10 @@ RESOLUTION_STABLE_MINUTES = 45
 # private: anyone with one can post into that channel.
 DISCORD_WEBHOOK_URL = _secret("DISCORD_WEBHOOK_URL")
 DISCORD_STATUS_INTERVAL_MIN = 5
+# Paper-signal tracking embed (fires alongside every status update above).
+# Blank = post to DISCORD_WEBHOOK_URL as its own separate message; set a
+# webhook here to route the paper ledger to its own channel instead.
+DISCORD_PAPER_WEBHOOK_URL = _secret("DISCORD_PAPER_WEBHOOK_URL")
 
 # Optional: a second webhook for one polished message per settled position
 # (includes what the model believed vs what the market charged at entry).
