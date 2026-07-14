@@ -292,6 +292,17 @@ REPORT_TIMEZONE = "America/New_York"
 SCAN_INTERVAL_SECONDS = 60
 CANCEL_UNFILLED_AFTER_MIN = 10
 
+# --- Rescheduled-match exit ---
+# A filled position whose match gets POSTPONED holds a broken premise: entry
+# was priced on conditions an hour before a match that now plays days later
+# (lineups/meta can change), while capital sits locked. Once a position is
+# this many hours past its ORIGINAL start, the bot re-checks the market's
+# own gameStartTime; if the exchange has moved the start INTO THE FUTURE
+# (its word — never elapsed time, so a long game or a short rain delay can
+# never trigger this), the position is closed at market and booked from the
+# actual fills. 0 disables the feature.
+RESCHEDULE_EXIT_AFTER_HOURS = 2
+
 # --- Closing-line value (CLV) capture ---
 # The single fastest read on whether the strategy has real edge: for each open
 # position, snapshot the market's price for our side in the final minutes
