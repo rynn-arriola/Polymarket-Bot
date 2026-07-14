@@ -1732,8 +1732,8 @@ def cmd_run():
     log.info(f"Ratings age: {reporting.freshness_oneline()}")
     pub = make_client(False)
     auth = make_client(True)
-    reporting.post_discord_summary("Bot started")
     reporting.post_discord_paper_summary("Bot started")
+    reporting.post_discord_summary("Bot started")
     reporting.post_discord_clv("Bot started")
     reporting.post_discord_paper_clv("Bot started")
     last_discord_status = time.monotonic()
@@ -1771,13 +1771,13 @@ def cmd_run():
                 reconcile_live_pnl(auth)
             if settled_ids:
                 reporting.post_discord_settlements(settled_ids)
-                reporting.post_discord_summary(f"{len(settled_ids)} position(s) settled")
                 reporting.post_discord_paper_summary(f"{len(settled_ids)} position(s) settled")
+                reporting.post_discord_summary(f"{len(settled_ids)} position(s) settled")
                 last_discord_status = time.monotonic()
             interval = getattr(config, "DISCORD_STATUS_INTERVAL_MIN", 30) * 60
             if interval > 0 and time.monotonic() - last_discord_status >= interval:
-                reporting.post_discord_summary("Scheduled status update")
                 reporting.post_discord_paper_summary("Scheduled status update")
+                reporting.post_discord_summary("Scheduled status update")
                 last_discord_status = time.monotonic()
             # CLV report N times a day (default 4 = every 6h) on its own webhook
             per_day = getattr(config, "CLV_REPORT_TIMES_PER_DAY", 0)
