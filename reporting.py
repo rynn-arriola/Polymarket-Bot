@@ -249,12 +249,95 @@ def stats_by_price() -> list[dict]:
     return out
 
 
+def manual_stats_for_period(kind: str) -> dict:
+    """Stats for trades recorded by manual_trades.py.
+
+    Kept separate from bot `positions` stats on purpose: manual bets do not
+    have model_prob/market_price/CLV semantics and must not dilute edge
+    validation. Period attribution follows the bot convention: a manual trade
+    belongs to the period it was recorded/opened in.
+    """
+    if kind in ("today", "week", "month"):
+        start, end = period_bounds_utc(kind)
+        created_filter = "created_at >= ? AND created_at < ?"
+        args = (start, end)
+    elif kind == "overall":
+        created_filter = "1=1"
+        args = ()
+    else:
+        raise ValueError(f"Unknown manual stats period: {kind}")
+    created_filter += " AND live = ?"
+    args = args + (1 if config.LIVE else 0,)
+
+    try:
+        row = db(
+            f"""SELECT COUNT(*),
+                       SUM(CASE WHEN status IN ('pending','open') THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status='won' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status='push' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status='cashed_out' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END),
+                       COALESCE(SUM(CASE WHEN status IN ('won','lost','push','cashed_out')
+                                         THEN pnl ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN status != 'cancelled' THEN stake ELSE 0 END), 0)
+                FROM manual_trades WHERE {created_filter}""",
+            args,
+            fetch=True,
+        )[0]
+    except Exception:
+        # Older DB before db_init() creates manual_trades, or a deployment
+        # where the CLI has not been used yet. Reporting should stay quiet.
+        row = (0, 0, 0, 0, 0, 0, 0, 0.0, 0.0)
+
+    entries, open_n, won, lost, push, cashed, cancelled, pnl, staked = row
+    won, lost = won or 0, lost or 0
+    return {
+        "entries": entries or 0,
+        "open": open_n or 0,
+        "won": won,
+        "lost": lost,
+        "push": push or 0,
+        "cashed_out": cashed or 0,
+        "cancelled": cancelled or 0,
+        "settled": won + lost + (push or 0) + (cashed or 0),
+        "pnl": pnl or 0.0,
+        "staked": staked or 0.0,
+        "win_rate": pct(won, lost),
+        "yield": ((pnl or 0.0) / staked) if staked else None,
+    }
+
+
+def manual_stats_by_sport() -> list[dict]:
+    live = 1 if config.LIVE else 0
+    try:
+        rows = db(
+            """SELECT sport, COUNT(*),
+                      COALESCE(SUM(CASE WHEN status IN ('won','lost','push','cashed_out')
+                                        THEN pnl ELSE 0 END), 0)
+               FROM manual_trades
+               WHERE live = ?
+               GROUP BY sport
+               ORDER BY COUNT(*) DESC""",
+            (live,),
+            fetch=True,
+        )
+    except Exception:
+        return []
+    return [{"sport": sport or "UNKNOWN", "entries": n or 0, "pnl": pnl or 0.0}
+            for sport, n, pnl in rows]
+
+
 def summary_snapshot() -> dict:
     return {
         "today": stats_for_period("today"),
         "week": stats_for_period("week"),
         "month": stats_for_period("month"),
         "overall": stats_for_period("overall"),
+        "manual_today": manual_stats_for_period("today"),
+        "manual_week": manual_stats_for_period("week"),
+        "manual_month": manual_stats_for_period("month"),
+        "manual_overall": manual_stats_for_period("overall"),
         "mode": "LIVE" if config.LIVE else "DRY-RUN",
         "updated": datetime.now(timezone.utc).isoformat(),
     }
@@ -282,8 +365,23 @@ def format_period(label: str, stats: dict) -> str:
     )
 
 
-def format_summary_text(snapshot: dict, title: str = "POLYBOT SUMMARY") -> str:
+def format_manual_period(label: str, stats: dict) -> str:
+    if not stats.get("entries"):
+        return ""
+    y = stats.get("yield")
+    yield_str = f" (yield {y:+.1%} on ${stats['staked']:.0f})" if y is not None else ""
     return (
+        f"{label}\n"
+        f"  P&L: {stats['pnl']:+.2f}{yield_str}\n"
+        f"  Record: {stats['won']}W / {stats['lost']}L / {stats['push']}P / "
+        f"{stats['cashed_out']} cashout / {stats['cancelled']} cancel\n"
+        f"  Win rate: {stats['win_rate']}\n"
+        f"  Entries: {stats['entries']} | Open: {stats['open']}"
+    )
+
+
+def format_summary_text(snapshot: dict, title: str = "POLYBOT SUMMARY") -> str:
+    text = (
         f"\n=== {title} ===\n"
         f"Mode: {snapshot['mode']}\n\n"
         f"{format_period('Today', snapshot['today'])}\n\n"
@@ -291,6 +389,10 @@ def format_summary_text(snapshot: dict, title: str = "POLYBOT SUMMARY") -> str:
         f"{format_period('This Month', snapshot['month'])}\n\n"
         f"{format_period('Overall', snapshot['overall'])}\n"
     )
+    manual = format_manual_period("Manual Trades", snapshot.get("manual_overall", {}))
+    if manual:
+        text += f"\n{manual}\n"
+    return text
 
 
 FRESHNESS_FILE = "elo_freshness.json"
@@ -683,12 +785,41 @@ def discord_field(label: str, stats: dict, inline: bool) -> dict:
     }
 
 
+def discord_manual_field(stats: dict, inline: bool = False) -> dict | None:
+    if not stats.get("entries"):
+        return None
+    y = stats.get("yield")
+    yield_str = f"  Yield:    {y:+.1%}\n" if y is not None else ""
+    return {
+        "name": f"{pnl_emoji(stats['pnl'])} Manual Trades",
+        "value": (
+            "```ansi\n"
+            f"P&L:      {pnl_ansi(stats['pnl'])}\n"
+            f"Record:   {stats['won']}W / {stats['lost']}L / {stats['push']}P\n"
+            f"Cashout:  {stats['cashed_out']} | Cancelled: {stats['cancelled']}\n"
+            f"Entries:  {stats['entries']} (open {stats['open']})\n"
+            f"{yield_str}"
+            "```"
+        ),
+        "inline": inline,
+    }
+
+
 def post_discord_summary(reason: str = "Status update") -> bool:
     webhook = getattr(config, "DISCORD_WEBHOOK_URL", "").strip()
     if not webhook:
         return False
     snapshot = summary_snapshot()
     mode_badge = "🔴 LIVE" if snapshot["mode"] == "LIVE" else "🧪 DRY-RUN"
+    fields = [
+        discord_field("Today", snapshot["today"], True),
+        discord_field("This Week", snapshot["week"], True),
+        discord_field("This Month", snapshot["month"], True),
+        discord_field("Overall", snapshot["overall"], False),
+    ]
+    manual_field = discord_manual_field(snapshot.get("manual_overall", {}), False)
+    if manual_field:
+        fields.append(manual_field)
     payload = {
         "username": BOT_NAME,
         "embeds": [
@@ -696,12 +827,7 @@ def post_discord_summary(reason: str = "Status update") -> bool:
                 "title": "📊 Polybot Status",
                 "description": reason,
                 "color": embed_color(snapshot["today"]["pnl"]),
-                "fields": [
-                    discord_field("Today", snapshot["today"], True),
-                    discord_field("This Week", snapshot["week"], True),
-                    discord_field("This Month", snapshot["month"], True),
-                    discord_field("Overall", snapshot["overall"], False),
-                ],
+                "fields": fields,
                 "footer": {"text": f"{BOT_NAME} | {mode_badge}"},
                 "timestamp": snapshot["updated"],
             }
@@ -752,6 +878,19 @@ def post_discord_daily_digest() -> bool:
                   f"Entries {ov['entries']} (open {ov['open']})\n```"),
         "inline": False,
     }]
+    manual = manual_stats_for_period("overall")
+    if manual.get("entries"):
+        my = f"  yield {manual['yield']:+.1%}" if manual.get("yield") is not None else ""
+        m_code = "32" if manual["pnl"] > 0 else "31" if manual["pnl"] < 0 else "2;37"
+        fields.append({
+            "name": "Manual Trades (separate ledger)",
+            "value": ("```ansi\n"
+                      f"\x1b[{m_code}mP&L     {manual['pnl']:+.2f}{my}\x1b[0m\n"
+                      f"Record  {manual['won']}W-{manual['lost']}L-{manual['push']}P   "
+                      f"cashout {manual['cashed_out']}   cancelled {manual['cancelled']}\n"
+                      f"Entries {manual['entries']} (open {manual['open']})\n```"),
+            "inline": False,
+        })
     # Per-sport win rate is NOT here — it's on the CLV tracker webhook now.
 
     div_rows = stats_by_divergence()
@@ -893,6 +1032,20 @@ def post_discord_clv(reason: str = "CLV update") -> bool:
                 "inline": False,
             })
 
+    manual = manual_stats_for_period("overall")
+    if manual.get("entries"):
+        my = f"  yield {manual['yield']:+.1%}" if manual.get("yield") is not None else ""
+        m_code = "32" if manual["pnl"] > 0 else "31" if manual["pnl"] < 0 else "2;37"
+        fields.append({
+            "name": "Manual trades (not part of CLV/model edge)",
+            "value": ("```ansi\n"
+                      f"\x1b[{m_code}mP&L     {manual['pnl']:+.2f}{my}\x1b[0m\n"
+                      f"Record  {manual['won']}W-{manual['lost']}L-{manual['push']}P   "
+                      f"cashout {manual['cashed_out']}   cancelled {manual['cancelled']}\n"
+                      f"Entries {manual['entries']} (open {manual['open']})\n```"),
+            "inline": False,
+        })
+
     mode_badge = "🔴 LIVE" if config.LIVE else "🧪 DRY-RUN"
     # Headline verdict from overall CLV: green embed + 🟢 = the market is
     # moving toward our bets (edge looks real); red + 🔴 = moving against us;
@@ -1000,6 +1153,87 @@ def post_discord_settlements(position_ids: list[int]) -> int:
         if _post(webhook, payload, f"settlement ({slug})"):
             posted += 1
     return posted
+
+
+def post_discord_manual_trade(trade_id: int) -> bool:
+    """Settlement-webhook card for a manually tracked trade.
+
+    Uses the same webhook/style as bot settlements, but the wording is clear
+    that this was not a bot-entered model trade and therefore has no model vs
+    market edge block.
+    """
+    webhook = getattr(config, "DISCORD_SETTLEMENT_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return False
+    rows = db(
+        """SELECT market_slug, matchup, side, status, pnl, live, closed_at,
+                  sport, price, quantity, stake, close_price, close_reason, notes
+           FROM manual_trades WHERE id=?""",
+        (trade_id,),
+        fetch=True,
+    )
+    if not rows:
+        return False
+    (slug, matchup, side, status, pnl, live, closed_at, sport, price, quantity,
+     stake, close_price, close_reason, notes) = rows[0]
+    pnl = float(pnl or 0)
+    outcome = str(status or "updated").upper()
+    mode_badge = "LIVE" if live else "DRY-RUN"
+    color_name = "PROFIT" if pnl > 0 else "LOSS" if pnl < 0 else "EVEN"
+    match = matchup or slug or f"Manual trade #{trade_id}"
+    match_label = f"Manual Trade ({sport})" if sport else "Manual Trade"
+    try:
+        entry_line = f"Filled:  ${float(price):.2f} x {float(quantity):g} = ${float(stake):.2f}"
+    except (TypeError, ValueError):
+        entry_line = "Filled:  n/a"
+    close_line = ""
+    if close_price is not None:
+        try:
+            close_line = f"\nClose:   ${float(close_price):.2f}"
+        except (TypeError, ValueError):
+            pass
+    reason_line = f"\nReason:  {close_reason}" if close_reason else ""
+    notes_line = f"\nNotes:   {notes}" if notes else ""
+    payload = {
+        "username": BOT_NAME,
+        "embeds": [
+            {
+                "author": {"name": "Polybot Manual Trade"},
+                "description": f"# {pnl_emoji(pnl)} {outcome} | {color_name}",
+                "color": embed_color(pnl),
+                "fields": [
+                    {
+                        "name": match_label,
+                        "value": f"```ansi\n{settlement_ansi(match, pnl)}\n```",
+                        "inline": False,
+                    },
+                    {
+                        "name": "Pick",
+                        "value": f"```ansi\n{settlement_ansi(side or 'Unknown', pnl)}\n```",
+                        "inline": True,
+                    },
+                    {
+                        "name": "Result",
+                        "value": f"```ansi\n{settlement_ansi(outcome, pnl)}\n```",
+                        "inline": True,
+                    },
+                    {
+                        "name": "Profit / Loss",
+                        "value": f"```ansi\n{settlement_ansi(money(pnl), pnl)}\n```",
+                        "inline": True,
+                    },
+                    {
+                        "name": "Manual entry",
+                        "value": f"```ansi\n{settlement_ansi(entry_line + close_line + reason_line + notes_line, pnl)}\n```",
+                        "inline": False,
+                    },
+                ],
+                "footer": {"text": f"{BOT_NAME} | manual | {mode_badge}"},
+                "timestamp": closed_at or datetime.now(timezone.utc).isoformat(),
+            }
+        ],
+    }
+    return _post(webhook, payload, f"manual trade ({trade_id})")
 
 
 # ------------------------------------------------------------------
