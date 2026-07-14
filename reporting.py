@@ -1176,19 +1176,19 @@ def post_discord_clv(reason: str = "CLV update") -> bool:
 
     paper_overall = signal_stats_for_period("overall")
     if paper_overall.get("entries"):
-        paper_lines = []
+        paper_lines = [f"{'period':<10}{'sig':>5}{'taken':>7}{'skip':>6}{'record':>10}{'est P&L':>10}{'CLV':>8}"]
         for label, kind in (("Today", "today"), ("Overall", "overall")):
             s = signal_stats_for_period(kind)
-            clv = (f"{s['avg_clv']:+.2%} (n={s['clv_n']})"
-                   if s.get("clv_n") else "--")
+            record = f"{s['won']}W-{s['lost']}L"
+            clv = f"{s['avg_clv']:+.2%}" if s.get("clv_n") else "--"
+            code = "32" if s["paper_pnl"] > 0 else "31" if s["paper_pnl"] < 0 else "2;37"
             paper_lines.append(
-                f"{label}: {s['entries']} signals | traded {s['traded']} | "
-                f"not traded {s['not_traded']} | {s['won']}W-{s['lost']}L | "
-                f"est P&L {s['paper_pnl']:+.2f} | CLV {clv}"
+                f"\x1b[{code}m{label:<10}{s['entries']:>5}{s['traded']:>7}{s['not_traded']:>6}"
+                f"{record:>10}{s['paper_pnl']:>+10.2f}{clv:>8}\x1b[0m"
             )
         fields.append({
             "name": "Paper signals (all valid candidates; excluded from real P&L)",
-            "value": "\n".join(paper_lines),
+            "value": "```ansi\n" + "\n".join(paper_lines) + "\n```",
             "inline": False,
         })
 
