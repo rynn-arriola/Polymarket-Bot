@@ -1,0 +1,27 @@
+{
+  "sport": "lol",
+  "features": [
+    "elo_exp",
+    "elo_gap",
+    "rating_a",
+    "rating_b",
+    "games_a",
+    "games_b",
+    "p_exp",
+    "p_gap",
+    "p_min_gap",
+    "p_spread_diff",
+    "p_experience_diff"
+  ],
+  "calibration": {
+    "a": 1.0109,
+    "b": -0.0096
+  },
+  "order": "alpha",
+  "best_iteration": 191,
+  "beats_elo": true,
+  "beat_margin": 0.002,
+  "elo_brier": 0.2183,
+  "xgb_brier": 0.2102,
+  "trained_at": "2026-07-14T02:07:26.874278+00:00"
+}
