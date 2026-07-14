@@ -328,11 +328,15 @@ def manual_stats_by_sport() -> list[dict]:
             for sport, n, pnl in rows]
 
 
-def signal_stats_for_period(kind: str) -> dict:
+def signal_stats_for_period(kind: str, decision: str | None = None) -> dict:
     """Paper-only results for every valid candidate the bot observed.
 
     These numbers never feed real P&L, bankroll, risk, or settlement reports.
     They exist to show whether price/risk filters are declining good signals.
+
+    decision: None = all signals, 'traded' = signals that became real orders,
+    'skipped' = everything else — the skipped cohort's record vs the traded
+    one is the direct answer to "are the filters declining good signals?".
     """
     if kind in ("today", "week", "month"):
         start, end = period_bounds_utc(kind)
@@ -345,6 +349,10 @@ def signal_stats_for_period(kind: str) -> dict:
         raise ValueError(f"Unknown signal stats period: {kind}")
     created_filter += " AND live = ?"
     args = args + (1 if config.LIVE else 0,)
+    if decision == "traded":
+        created_filter += " AND decision = 'traded'"
+    elif decision == "skipped":
+        created_filter += " AND decision != 'traded'"
     try:
         row = db(
             f"""SELECT COUNT(*),
@@ -915,31 +923,87 @@ def discord_manual_field(stats: dict, inline: bool = False) -> dict | None:
     }
 
 
-def discord_signal_field(stats: dict, inline: bool = False) -> dict | None:
-    if not stats.get("entries"):
-        return None
-    clv_line = ""
-    if stats.get("clv_n"):
-        clv_line = f"CLV:      {stats['avg_clv']:+.1%} (beat {stats['clv_beat']:.0%}, n={stats['clv_n']})\n"
-    blocks = signal_not_traded_reasons()
-    blocks_line = ""
-    if blocks:
-        shown = "; ".join(f"{count}x {reason[:52]}" for reason, count in blocks)
-        blocks_line = f"Blocked:  {shown}\n"
+def discord_paper_field(label: str, stats: dict, inline: bool) -> dict:
+    """One period of paper-signal stats, visually matching discord_field."""
     return {
-        "name": "Paper Signals (not real P&L)",
+        "name": f"{pnl_emoji(stats['paper_pnl'])} {label}",
         "value": (
             "```ansi\n"
-            f"Est P&L:  {stats['paper_pnl']:+.2f}\n"
-            f"Record:    {stats['won']}W / {stats['lost']}L / {stats['push']}P\n"
-            f"Signals:   {stats['entries']} (traded {stats['traded']}, not traded {stats['not_traded']})\n"
-            f"Open:      {stats['open']}\n"
-            f"{clv_line}"
-            f"{blocks_line}"
+            f"Est P&L:  {pnl_ansi(stats['paper_pnl'])}\n"
+            f"Record:   {stats['won']}W / {stats['lost']}L / {stats['push']}P\n"
+            f"Win rate: {stats['win_rate']}\n"
+            f"Signals:  {stats['entries']} (open {stats['open']})\n"
+            f"Taken:    {stats['traded']} | Skipped: {stats['not_traded']}\n"
             "```"
         ),
         "inline": inline,
     }
+
+
+def post_discord_paper_summary(reason: str = "Paper tracking update") -> bool:
+    """The paper-signal ledger's OWN status embed, mirroring the real
+    summary's layout (Today/Week/Month/Overall) so the two read side by side
+    but never blend. Adds the split the ledger exists for — the skipped
+    cohort's record vs the taken one — plus CLV and top block reasons.
+
+    Posts to DISCORD_PAPER_WEBHOOK_URL when set (its own channel), else to
+    the main summary webhook as a separate message.
+    """
+    webhook = (getattr(config, "DISCORD_PAPER_WEBHOOK_URL", "").strip()
+               or getattr(config, "DISCORD_WEBHOOK_URL", "").strip())
+    if not webhook:
+        return False
+    overall = signal_stats_for_period("overall")
+    if not overall.get("entries"):
+        return False  # nothing recorded yet — stay quiet
+    today = signal_stats_for_period("today")
+    fields = [
+        discord_paper_field("Today", today, True),
+        discord_paper_field("This Week", signal_stats_for_period("week"), True),
+        discord_paper_field("This Month", signal_stats_for_period("month"), True),
+        discord_paper_field("Overall", overall, False),
+    ]
+
+    # THE question this ledger answers: do the signals the filters decline
+    # perform differently from the ones that became real orders?
+    split_lines = [f"{'cohort':<9}{'n':>5}{'record':>10}{'win%':>7}{'est P&L':>10}{'CLV':>8}"]
+    for label, cohort in (("taken", "traded"), ("skipped", "skipped")):
+        s = signal_stats_for_period("overall", cohort)
+        record = f"{s['won']}W-{s['lost']}L"
+        clv = f"{s['avg_clv']:+.2%}" if s.get("clv_n") else "--"
+        code = "32" if s["paper_pnl"] > 0 else "31" if s["paper_pnl"] < 0 else "2;37"
+        split_lines.append(
+            f"\x1b[{code}m{label:<9}{s['entries']:>5}{record:>10}{s['win_rate']:>7}"
+            f"{s['paper_pnl']:>+10.2f}{clv:>8}\x1b[0m"
+        )
+    fields.append({
+        "name": "Taken vs skipped (all-time) — are the filters right?",
+        "value": "```ansi\n" + "\n".join(split_lines) + "\n```",
+        "inline": False,
+    })
+
+    blocks = signal_not_traded_reasons()
+    if blocks:
+        fields.append({
+            "name": "Top skip reasons (all-time)",
+            "value": "```ansi\n" + "\n".join(
+                f"{count:>4}x  {reason[:70]}" for reason, count in blocks) + "\n```",
+            "inline": False,
+        })
+
+    payload = {
+        "username": BOT_NAME,
+        "embeds": [{
+            "title": "🧪 Paper Signals — tracking only",
+            "description": f"{reason} • every valid signal, incl. declined ones — "
+                           "estimated results, excluded from real P&L",
+            "color": embed_color(today["paper_pnl"]),
+            "fields": fields,
+            "footer": {"text": f"{BOT_NAME} | 🧪 paper ledger — not real money"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }],
+    }
+    return _post(webhook, payload, "paper summary")
 
 
 def post_discord_summary(reason: str = "Status update") -> bool:
@@ -957,9 +1021,9 @@ def post_discord_summary(reason: str = "Status update") -> bool:
     manual_field = discord_manual_field(snapshot.get("manual_overall", {}), False)
     if manual_field:
         fields.append(manual_field)
-    signal_field = discord_signal_field(snapshot.get("signals_overall", {}), False)
-    if signal_field:
-        fields.append(signal_field)
+    # Paper signals intentionally NOT here — they have their own embed
+    # (post_discord_paper_summary) on the same cadence, so estimated
+    # numbers never sit inside the real-money summary.
     payload = {
         "username": BOT_NAME,
         "embeds": [
@@ -1018,23 +1082,8 @@ def post_discord_daily_digest() -> bool:
                   f"Entries {ov['entries']} (open {ov['open']})\n```"),
         "inline": False,
     }]
-    signals_overall = signal_stats_for_period("overall")
-    if signals_overall.get("entries"):
-        signal_lines = [f"{'period':<10}{'sig':>5}{'taken':>7}{'skip':>6}{'record':>10}{'est P&L':>10}{'CLV':>8}"]
-        for label, kind in (("Today", "today"), ("Overall", "overall")):
-            s = signal_stats_for_period(kind)
-            record = f"{s['won']}W-{s['lost']}L"
-            clv = f"{s['avg_clv']:+.2%}" if s.get("clv_n") else "--"
-            code = "32" if s["paper_pnl"] > 0 else "31" if s["paper_pnl"] < 0 else "2;37"
-            signal_lines.append(
-                f"\x1b[{code}m{label:<10}{s['entries']:>5}{s['traded']:>7}{s['not_traded']:>6}"
-                f"{record:>10}{s['paper_pnl']:>+10.2f}{clv:>8}\x1b[0m"
-            )
-        fields.append({
-            "name": "Paper signals (all valid candidates; excluded from real P&L)",
-            "value": "```ansi\n" + "\n".join(signal_lines) + "\n```",
-            "inline": False,
-        })
+    # Paper signals are NOT in the digest — they live on their own embed
+    # (post_discord_paper_summary), keeping this digest real-money only.
 
     manual = manual_stats_for_period("overall")
     if manual.get("entries"):
@@ -1174,23 +1223,7 @@ def post_discord_clv(reason: str = "CLV update") -> bool:
             "inline": False,
         })
 
-    paper_overall = signal_stats_for_period("overall")
-    if paper_overall.get("entries"):
-        paper_lines = [f"{'period':<10}{'sig':>5}{'taken':>7}{'skip':>6}{'record':>10}{'est P&L':>10}{'CLV':>8}"]
-        for label, kind in (("Today", "today"), ("Overall", "overall")):
-            s = signal_stats_for_period(kind)
-            record = f"{s['won']}W-{s['lost']}L"
-            clv = f"{s['avg_clv']:+.2%}" if s.get("clv_n") else "--"
-            code = "32" if s["paper_pnl"] > 0 else "31" if s["paper_pnl"] < 0 else "2;37"
-            paper_lines.append(
-                f"\x1b[{code}m{label:<10}{s['entries']:>5}{s['traded']:>7}{s['not_traded']:>6}"
-                f"{record:>10}{s['paper_pnl']:>+10.2f}{clv:>8}\x1b[0m"
-            )
-        fields.append({
-            "name": "Paper signals (all valid candidates; excluded from real P&L)",
-            "value": "```ansi\n" + "\n".join(paper_lines) + "\n```",
-            "inline": False,
-        })
+    # Paper signals are NOT here either — see post_discord_paper_summary.
 
     # Per-sport win rate — lives here on the CLV tracker (kept off the summary).
     sport_rows = stats_by_sport()
