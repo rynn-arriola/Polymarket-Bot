@@ -2,25 +2,27 @@
 
 The operator trades by hand in the Polymarket app on the same account the bot
 uses: standalone manual bets (longs AND shorts), adding fills to an existing
-manual bet, cashing a bet out early, and cashing out the bot's own positions.
-The exchange nets all of it silently; nothing tells the bot. Before this
-module existed the importer read only the FIRST batch of fills, treated sells
-as buys, and a position the operator had flattened waited forever for a
-POSITION_RESOLUTION that never comes (the exchange only posts one for a
-position actually held at resolution). All three failure modes are real,
-observed on 2026-07-15 (fra-esp / eng-arg / wsh-tor).
+bet, cashing a bet out early, and cashing out the bot's own positions. The
+exchange nets all of it silently; nothing tells the bot.
 
-Design rule: every pass RECOMPUTES from the exchange's full fill history and
-overwrites — no incremental bookkeeping, so a crashed or repeated pass can
-never double-count. The arithmetic was validated against the exchange's own
-figures for all three incident markets before this shipped (cost basis
-matches beforePosition.cost to the cent; realized P&L matches the cash that
-hit the balance).
+DIRECTION IS IN THE INSTRUMENT FRAME, NOT YOUR FRAME (learned the hard way,
+2026-07-15). A market has a canonical long side (the favorite/"YES") and a
+short side (the underdog/"NO"). Backing the underdog — e.g. BUYING Toronto
+when Toronto is the NO side — is recorded on the fill as `order.side =
+ORDER_SIDE_SELL`. Reading that literal side inverted the P&L sign on every
+underdog bet: three real cash-outs (fra-esp/eng-arg/wsh-tor) that were
+LOSSES got booked as equal-size GAINS (+$132 shown vs −$544 real). Never use
+`order.side` for the operator's economic direction. The trustworthy fields:
 
-Fill-money semantics (verified 2026-07-15 against real fills):
-  BUY  trade.cost  = cash OUT, fee-inclusive
-  SELL trade.cost  = cash IN, already net of fee
-so P&L needs no separate fee handling.
+  order.action  ORDER_ACTION_BUY / ORDER_ACTION_SELL   -> the operator's own
+                buy/sell of their chosen team (what they clicked)
+  trade.effectiveRealizedPnl                            -> the EXCHANGE's own
+                realized P&L on a closing fill, fee-exact, correctly signed.
+                Absent on opening fills. This is the authority — we sum it
+                rather than re-deriving P&L from fill directions ourselves.
+
+So realized P&L never comes from our arithmetic anymore; it comes from the
+exchange. We only use `action` to tell held-vs-flat and to label the entry.
 
 Shared by divergence_bot.py (per-cycle pass) and manual_trades.py (ad-hoc
 `sync` subcommand). Imports only config/db/reporting — never the Elo stack.
@@ -39,6 +41,8 @@ from db import db
 log = logging.getLogger("divergence_bot.manual_sync")
 
 MANUAL = "MANUAL_ORDER_INDICATOR_MANUAL"
+ACTION_BUY = "ORDER_ACTION_BUY"
+ACTION_SELL = "ORDER_ACTION_SELL"
 
 # Sentinel: the resolution check itself FAILED (feed down, rate-limited,
 # unrecognized shape). Distinct from None = the feed answered and there is
@@ -47,6 +51,8 @@ MANUAL = "MANUAL_ORDER_INDICATOR_MANUAL"
 # because the two cases were conflated — callers must retry on this value
 # and never conclude anything from it.
 RESOLUTION_CHECK_FAILED = object()
+
+EPS = 0.01  # contracts; below this a position is flat
 
 
 def _utc_now_iso() -> str:
@@ -75,16 +81,17 @@ def resolution_pnl(auth, slug: str):
     RESOLUTION_CHECK_FAILED when the check itself failed — retry later.
     Callers should branch with isinstance(res, tuple) for the settled case.
 
+    P&L here is cashValue - cost of the held-to-settlement position; it is
+    side-independent (a short's cost basis and settlement value are both in
+    the same frame) so it needs none of the action/effectiveRealizedPnl
+    handling the trade path does.
+
     `stable` is False while the activity is younger than
     RESOLUTION_STABLE_MINUTES: the exchange RESTATES the cost basis (rolls
     fees in) shortly after posting the resolution — 16 positions audited on
     2026-07-13 carried P&L read too early, overstating the book ~$10.6.
     Callers may act on an unstable figure (it's close, and Discord shouldn't
-    wait) but must not mark it final (pnl_reconciled) until stable.
-
-    This feed is the same one the app's History tab shows, and it publishes
-    well BEFORE the public /markets/{slug}/settlement record — polling only
-    the latter made settlement messages lag by hours (reported 2026-07-13)."""
+    wait) but must not mark it final (pnl_reconciled) until stable."""
     try:
         resp = auth.portfolio.activities({
             "marketSlug": slug,
@@ -121,20 +128,20 @@ def resolution_pnl(auth, slug: str):
     return round(cash_value - cost, 2), stable
 
 
+def _order_of(trade: dict) -> dict:
+    ex = trade.get("aggressorExecution") or {}
+    return ex.get("order") or trade.get("aggressor") or {}
+
+
 def manual_fills(auth, slug: str, since=None):
     """Every MANUAL fill on a market, oldest first. None = fetch failed
     (conclude nothing, retry later); [] = feed answered, no manual fills.
 
-    Bot fills carry MANUAL_ORDER_INDICATOR_AUTOMATIC and are excluded, which
-    is what lets the same market carry a bot position AND the operator's own
-    activity without cross-contamination. `since` (aware datetime or ISO
-    string) drops fills at or before it — used to scope to a trading episode
-    (fills newer than a bot entry, or than a previous closed manual row).
-
-    Known gap: the fill's order metadata is read from the AGGRESSOR side of
-    the trade. Every observed app order crossed the book (taker), so this has
-    matched reality; a manual order that rested and filled passively could be
-    missed. If a manual fill ever seems invisible, this is where to look."""
+    Each fill carries the operator's TRUE direction (order.action, not the
+    instrument-frame order.side) and the exchange's own realized P&L
+    (trade.effectiveRealizedPnl, present only on closing fills). Bot fills
+    carry MANUAL_ORDER_INDICATOR_AUTOMATIC and are excluded. `since` (aware
+    datetime or ISO string) drops fills at or before it."""
     try:
         resp = auth.portfolio.activities({
             "marketSlug": slug,
@@ -153,29 +160,36 @@ def manual_fills(auth, slug: str, since=None):
         trade = activity.get("trade") if isinstance(activity, dict) else None
         if not isinstance(trade, dict):
             continue
-        execution = trade.get("aggressorExecution") or {}
-        order = execution.get("order") or trade.get("aggressor") or {}
+        order = _order_of(trade)
         # The marketSlug re-check is not paranoia: the activities endpoint
         # returns account-level items (deposits, transfers) even when asked
         # for one market, so everything must be re-matched.
         if (order.get("marketSlug") != slug
                 or order.get("manualOrderIndicator") != MANUAL):
             continue
-        qty = _money_value(trade.get("qtyDecimal") or trade.get("qty")
-                           or execution.get("lastShares"))
+        action = order.get("action")
+        if action not in (ACTION_BUY, ACTION_SELL):
+            # No trustworthy direction -> skip rather than guess (guessing is
+            # exactly what caused the sign inversion).
+            log.warning(f"Manual fill on {slug} has no order.action ({action!r}) — skipped")
+            continue
+        qty = _money_value(trade.get("qtyDecimal") or trade.get("qty"))
         cost = _money_value(trade.get("cost"))
-        fee = _money_value(execution.get("commissionNotionalCollected"))
         if qty <= 0 or cost <= 0:
             continue
+        eff = trade.get("effectiveRealizedPnl")
+        eff_realized = _money_value(eff) if eff else None
+        intent = str(order.get("intent") or "")
+        is_short = "SHORT" in intent or order.get("outcomeSide") == "OUTCOME_SIDE_NO"
         created = _parse_ts(trade.get("createTime"))
         if since is not None and (created is None or created <= since):
             continue
         fills.append({
-            "is_buy": order.get("side") == "ORDER_SIDE_BUY",
+            "is_buy": action == ACTION_BUY,   # operator's own buy/sell
             "qty": qty,
-            "cost": cost,          # buy: fee-incl cash out; sell: fee-net cash in
-            "fee": fee,
-            "order_id": str(order.get("id") or ""),
+            "cost": cost,                      # cash magnitude of the fill (fee-incl)
+            "eff_realized": eff_realized,      # exchange's realized P&L on a close
+            "is_short": is_short,              # chosen team is the market's NO side
             "created": created,
             "created_raw": str(trade.get("createTime") or ""),
             "meta": order.get("marketMetadata") or trade.get("market") or {},
@@ -184,46 +198,29 @@ def manual_fills(auth, slug: str, since=None):
     return fills
 
 
-def replay_fills(fills):
-    """Average-cost replay of a chronological fill sequence.
+def summarize(fills):
+    """Reduce a chronological fill list to the current state, using the
+    exchange's own realized figure — no direction arithmetic of our own.
 
-    Returns (net_qty, open_cost, realized):
-      net_qty   signed position: > 0 long, < 0 short (sell-to-open)
-      open_cost cash at risk on what's still held (for a short: the net
-                credit received), fee-inclusive — matches the exchange's
-                beforePosition.cost bookkeeping
-      realized  P&L banked by fills that reduced the position
-
-    A fill that crosses through zero (sell more than held) is split: the
-    reducing part realizes P&L, the excess opens the opposite direction at
-    that fill's average price."""
-    net = 0.0
-    open_cost = 0.0
-    realized = 0.0
-    for f in fills:
-        qty, cost = f["qty"], f["cost"]
-        direction = 1.0 if f["is_buy"] else -1.0
-        while qty > 1e-9:
-            if net == 0 or (net > 0) == (direction > 0):
-                # opening / adding
-                net += direction * qty
-                open_cost += cost
-                qty = 0.0
-            else:
-                # reducing (possibly through zero)
-                reduce_qty = min(qty, abs(net))
-                fill_portion = cost * (reduce_qty / qty)
-                basis_portion = open_cost * (reduce_qty / abs(net))
-                if net > 0:   # long reduced by a sell: cash in minus basis out
-                    realized += fill_portion - basis_portion
-                else:         # short reduced by a buy: credit kept minus buyback
-                    realized += basis_portion - fill_portion
-                net += direction * reduce_qty
-                open_cost -= basis_portion
-                qty -= reduce_qty
-                cost -= fill_portion
-                if abs(net) < 1e-9:
-                    net, open_cost = 0.0, 0.0
+    Returns (net, open_cost, realized):
+      net       operator's chosen-team net contracts (BUY adds, SELL removes;
+                > 0 long the team, < 0 net short it, ~0 flat)
+      open_cost avg-cost basis of the still-held contracts (0 when flat)
+      realized  Σ trade.effectiveRealizedPnl over closing fills — the
+                exchange's own fee-exact, correctly-signed realized P&L
+    """
+    net = sum(f["qty"] if f["is_buy"] else -f["qty"] for f in fills)
+    buy_qty = sum(f["qty"] for f in fills if f["is_buy"])
+    buy_cost = sum(f["cost"] for f in fills if f["is_buy"])
+    sell_qty = sum(f["qty"] for f in fills if not f["is_buy"])
+    sell_cost = sum(f["cost"] for f in fills if not f["is_buy"])
+    realized = round(sum(f["eff_realized"] for f in fills if f["eff_realized"] is not None), 2)
+    if net > EPS and buy_qty > 0:            # net long the team: cost basis of held
+        open_cost = round(buy_cost * (net / buy_qty), 2)
+    elif net < -EPS and sell_qty > 0:        # net short the team: credit of held
+        open_cost = round(sell_cost * (abs(net) / sell_qty), 2)
+    else:
+        open_cost = 0.0
     return net, open_cost, realized
 
 
@@ -254,13 +251,14 @@ def import_manual_trade(auth, slug: str) -> bool:
     db(
         """INSERT INTO manual_trades
            (created_at, updated_at, market_slug, matchup, sport, side, price,
-            quantity, stake, live, order_id, status, notes)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            quantity, stake, live, order_id, status, is_long, notes)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (fills[0]["created_raw"] or now, now, slug,
          meta.get("title") or slug,
          str(team.get("league") or "manual").upper(),
          meta.get("outcome") or team.get("name") or "manual",
          0.0, 0.0, 0.0, 1, "", "open",
+         0 if fills[0]["is_short"] else 1,
          "Auto-imported from exchange manual activity."),
     )
     row = db("SELECT id FROM manual_trades ORDER BY id DESC LIMIT 1", fetch=True)[0]
@@ -269,19 +267,19 @@ def import_manual_trade(auth, slug: str) -> bool:
     return True
 
 
-def sync_manual_row(auth, trade_id: int, include_closed: bool = False):
+def sync_manual_row(auth, trade_id: int):
     """True one manual_trades row up against the exchange. Returns
     'closed' / 'updated' / None (nothing to do or couldn't check).
 
-    Idempotent: quantity/price/stake/direction are recomputed from the full
+    Idempotent: quantity/price/stake/pnl are recomputed from the full
     manual-fill history each call, never incremented. Rows with no exchange
-    fills (hand-entered hypotheticals) are left exactly as the human wrote
-    them. Closes as:
-      won/lost/push  — a POSITION_RESOLUTION exists (P&L = realized from any
-                       partial exits + the exchange's own resolution figure),
-                       only once the figure is fee-stable
+    fills (hand-entered hypotheticals) are left as the human wrote them.
+    P&L is the exchange's own (resolution figure and/or effectiveRealizedPnl),
+    never our arithmetic. Closes as:
+      won/lost/push  — a POSITION_RESOLUTION exists (held-to-settlement P&L
+                       plus any realized from partial exits), once fee-stable
       cashed_out     — the operator flattened the position with fills; no
-                       resolution will ever post for it"""
+                       resolution will post for it, P&L = realized"""
     rows = db(
         """SELECT market_slug, status, quantity, stake, pnl, price,
                   COALESCE(is_long, 1)
@@ -291,7 +289,7 @@ def sync_manual_row(auth, trade_id: int, include_closed: bool = False):
     if not rows:
         return None
     slug, status, old_qty, old_stake, old_pnl, old_price, old_is_long = rows[0]
-    if status not in ("open", "pending") and not include_closed:
+    if status not in ("open", "pending"):
         return None
     if not slug:
         return None
@@ -305,71 +303,79 @@ def sync_manual_row(auth, trade_id: int, include_closed: bool = False):
                     f"share this market — fills can't be attributed; close the "
                     f"extras with manual_trades.py")
         return None
-    fills = manual_fills(auth, slug, since=_episode_since(slug) if not include_closed else None)
+    fills = manual_fills(auth, slug, since=_episode_since(slug))
     if fills is None:
         return None    # fetch failed — conclude nothing
     if not fills:
         return None    # hand-entered row with no exchange trace — human's word stands
-    net, open_cost, realized = replay_fills(fills)
+    net, open_cost, realized = summarize(fills)
+    is_long = 0 if fills[0]["is_short"] else 1
     now = _utc_now_iso()
 
     res = resolution_pnl(auth, slug)
-    if isinstance(res, tuple) and abs(net) > 1e-6:
+    if isinstance(res, tuple) and abs(net) > EPS:
+        # Position was HELD to settlement: exchange resolution P&L on the held
+        # portion, plus anything realized from partial exits before it.
         pnl_res, stable = res
         if not stable:
             return None   # exchange still restating fees — close on a later pass
         pnl = round(realized + pnl_res, 2)
         new_status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
+        held_qty = round(abs(net), 2)
         db("""UPDATE manual_trades
               SET status=?, pnl=?, quantity=?, stake=?, price=?, is_long=?,
                   closed_at=?, updated_at=?, close_reason='exchange resolution'
               WHERE id=?""",
-           (new_status, pnl, round(abs(net), 2), round(open_cost, 2),
-            round(open_cost / abs(net), 4) if abs(net) > 1e-9 else old_price,
-            1 if net > 0 else 0, now, now, trade_id))
+           (new_status, pnl, held_qty, round(open_cost, 2),
+            round(open_cost / held_qty, 4) if held_qty > EPS else old_price,
+            is_long, now, now, trade_id))
         log.info(f"MANUAL TRADE SETTLED {new_status.upper()} {slug}  P&L {pnl:+.2f}")
         _post_card(trade_id, slug)
         return "closed"
 
-    if abs(net) < 0.01:
-        # Flattened by the operator's own fills. No resolution will ever post
-        # for a flat position — waiting for one leaves the row open forever.
-        pnl = round(realized, 2)
-        last_exit = next((f for f in reversed(fills)), None)
-        close_px = None
-        if last_exit is not None and last_exit["qty"] > 0:
-            close_px = round(last_exit["cost"] / last_exit["qty"], 4)
+    if abs(net) < EPS:
+        # Flattened by the operator's own fills (cashed out). No resolution
+        # will post for a flat position; P&L is the exchange's realized sum.
+        # Show the ENTRY (what was bought/staked) so the card reads sanely,
+        # with the realized loss/gain and the exit price.
+        buy_qty = sum(f["qty"] for f in fills if f["is_buy"])
+        buy_cost = sum(f["cost"] for f in fills if f["is_buy"])
+        exits = [f for f in fills if not f["is_buy"]]
+        exit_qty = sum(f["qty"] for f in exits)
+        exit_cash = sum(f["cost"] for f in exits)
+        close_px = round(exit_cash / exit_qty, 4) if exit_qty > EPS else None
+        entry_qty = round(buy_qty, 2) if buy_qty > EPS else round(exit_qty, 2)
+        entry_cost = round(buy_cost, 2) if buy_cost > EPS else round(exit_cash, 2)
         db("""UPDATE manual_trades
-              SET status='cashed_out', pnl=?, close_price=?, closed_at=?,
-                  updated_at=?, close_reason='cashed out on exchange'
+              SET status='cashed_out', pnl=?, quantity=?, stake=?, price=?,
+                  is_long=?, close_price=?, closed_at=?, updated_at=?,
+                  close_reason='cashed out on exchange'
               WHERE id=?""",
-           (pnl, close_px, now, now, trade_id))
-        log.warning(f"MANUAL TRADE CASHED OUT {slug}  realized P&L {pnl:+.2f}")
+           (realized, entry_qty, entry_cost,
+            round(entry_cost / entry_qty, 4) if entry_qty > EPS else old_price,
+            is_long, close_px, now, now, trade_id))
+        log.warning(f"MANUAL TRADE CASHED OUT {slug}  realized P&L {realized:+.2f}")
         _post_card(trade_id, slug)
         return "closed"
-
-    if status not in ("open", "pending"):
-        return None   # closed row still holding on-exchange: human closed it early on purpose
 
     # Still held: true up size / direction / cost basis, bank partial exits.
     new_qty = round(abs(net), 2)
     new_stake = round(open_cost, 2)
     new_price = round(open_cost / abs(net), 4)
-    new_is_long = 1 if net > 0 else 0
-    new_pnl = round(realized, 2) if abs(realized) >= 0.01 else None
+    new_pnl = realized if abs(realized) >= EPS else None
     changed = (abs((old_qty or 0) - new_qty) > 0.005
                or abs((old_stake or 0) - new_stake) > 0.005
                or (old_pnl is None) != (new_pnl is None)
                or abs((old_pnl or 0) - (new_pnl or 0)) > 0.005
-               or int(old_is_long) != new_is_long)
+               or int(old_is_long) != is_long)
     if not changed:
         return None
     db("""UPDATE manual_trades
           SET quantity=?, stake=?, price=?, is_long=?, pnl=?, updated_at=?
           WHERE id=?""",
-       (new_qty, new_stake, new_price, new_is_long, new_pnl, now, trade_id))
+       (new_qty, new_stake, new_price, is_long, new_pnl, now, trade_id))
     log.warning(f"MANUAL TRADE UPDATED {slug}: "
-                f"{'long' if new_is_long else 'SHORT'} {new_qty:g} contracts, "
+                f"{'long' if is_long else 'SHORT'} {new_qty:g} contracts, "
                 f"at-risk ${new_stake:.2f}"
                 + (f", realized so far {new_pnl:+.2f}" if new_pnl is not None else ""))
     _post_card(trade_id, slug)
@@ -404,15 +410,16 @@ def detect_manual_cashouts(auth) -> list[int]:
     record it. Returns position ids fully closed this pass (for the
     settlement Discord flow).
 
-    Direction-aware: a manual SELL reduces a long bot position; a manual BUY
-    reduces (covers) a short one. The opposite direction — the operator ADDING
-    to a bot position — is NOT split into a manual trade: the exchange's
-    resolution figure will cover the combined position and splitting it would
-    double-count, so it is recorded on the row and shouted about instead.
+    Direction-aware via the operator's own `action` (never the instrument
+    side): a manual SELL reduces a long bot position; a manual BUY reduces
+    (covers) a short one. The opposite — ADDING to a bot position by hand — is
+    recorded and shouted about, not split, because the exchange's resolution
+    figure will cover the combined position.
 
-    Partial exits overwrite manual_sold_qty / cashout_pnl (recomputed from the
-    full fill history — idempotent); settlement paths add cashout_pnl on top
-    of the resolution figure for what was still held."""
+    Realized P&L on the exit is the exchange's own effectiveRealizedPnl on
+    those fills (fee-exact, correctly signed, computed against the position's
+    real cost basis) — not our arithmetic. manual_sold_qty / cashout_pnl are
+    recomputed from the full fill history each pass (idempotent)."""
     settled: list[int] = []
     rows = db(
         """SELECT id, market_slug, price, quantity, stake, COALESCE(is_long,1),
@@ -428,8 +435,9 @@ def detect_manual_cashouts(auth) -> list[int]:
         fills = manual_fills(auth, slug, since=created_at)
         if not fills:   # None (couldn't check) and [] (no manual activity) alike
             continue
-        reduce_is_buy = not is_long   # covering a short is a BUY
-        cost_per = stake / quantity   # bot's cash at risk per contract
+        # A fill REDUCES the bot position when the operator's action is opposite
+        # the bot's side: bot long -> operator SELL reduces; bot short -> BUY.
+        reduce_is_buy = not bool(is_long)
         remaining = float(quantity)
         realized = 0.0
         sold = 0.0
@@ -438,22 +446,18 @@ def detect_manual_cashouts(auth) -> list[int]:
             if f["is_buy"] == reduce_is_buy:
                 take = min(f["qty"], remaining)
                 if take <= 1e-9:
-                    continue   # exits beyond the bot's size — untracked flip, warned below
-                fill_portion = f["cost"] * (take / f["qty"])
-                if is_long:
-                    realized += fill_portion - take * cost_per
-                else:
-                    # short: buy back `take` contracts for fill_portion; the
-                    # exchange releases $1/contract collateral less that cost
-                    realized += take - fill_portion - take * cost_per
+                    continue   # exits beyond the bot's size — flip, warned below
+                # Exchange's own realized on this closing fill (already correctly
+                # signed and fee-exact); prorate if the fill only partly reduces.
+                eff = f["eff_realized"]
+                if eff is not None:
+                    realized += eff * (take / f["qty"])
                 remaining -= take
                 sold += take
-                if f["qty"] - take > 1e-6:
-                    added += 0  # excess of a flipping fill handled by the warning below
             else:
                 added += f["qty"]
         now = _utc_now_iso()
-        if remaining < 0.5:
+        if remaining < 0.5 and sold > EPS:
             pnl = round(realized, 2)
             new_status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
             db("""UPDATE positions
@@ -466,7 +470,7 @@ def detect_manual_cashouts(auth) -> list[int]:
                         f"on the exchange — closed {new_status.upper()}, realized "
                         f"P&L {pnl:+.2f} (entry ${stake:.2f})")
             continue
-        if sold > old_sold + 0.01 or abs(realized - old_cashout) > 0.01:
+        if sold > old_sold + EPS or abs(round(realized, 2) - old_cashout) > EPS:
             db("""UPDATE positions
                   SET manual_sold_qty=?, cashout_pnl=?,
                       close_reason='partial_manual_cashout'
@@ -475,7 +479,7 @@ def detect_manual_cashouts(auth) -> list[int]:
             log.warning(f"PARTIAL MANUAL CASH-OUT: {slug} — {sold:g} of {quantity:g} "
                         f"contracts exited by hand, {realized:+.2f} banked; "
                         f"{remaining:g} still riding to settlement")
-        if added > old_added + 0.01:
+        if added > old_added + EPS:
             db("UPDATE positions SET manual_added_qty=? WHERE id=?",
                (round(added, 2), pid))
             log.warning(f"MANUAL ADDITION to bot position {slug}: {added:g} extra "
