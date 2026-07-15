@@ -101,8 +101,22 @@ except Exception as e:
 cutoff = q("SELECT MIN(created_at) FROM positions WHERE live=1")
 cutoff = (cutoff[0][0] if cutoff and cutoff[0][0] else "9999")
 
+# Markets the operator traded by hand live in manual_trades, NOT positions —
+# a resolution there is tracked, just in the other ledger. Without this the
+# audit false-flags every resolving manual bet as "untracked" (fra-esp,
+# 2026-07-15). Any live manual row for the slug counts as tracked; if it's
+# still open the sync just hasn't closed it yet (informational, not a flag).
+manual_rows = {}
+try:
+    for slug_m, status_m in q(
+            "SELECT market_slug, status FROM manual_trades WHERE live=1") or []:
+        manual_rows.setdefault(slug_m, set()).add(status_m)
+except Exception:
+    pass  # older DB without manual_trades — nothing manual to reconcile
+
 mismatched = []
 skipped_precutoff = 0
+skipped_manual = 0
 for a in activities:
     pr = a.get("positionResolution") or {}
     slug = pr.get("marketSlug") or "?"
@@ -113,6 +127,15 @@ for a in activities:
         ex_pnl = None
     row = q("SELECT status, pnl FROM positions WHERE market_slug=?", slug)
     if not row:
+        if slug in manual_rows:
+            # Tracked as a manual trade. Only note it if it's still open —
+            # that means the manual sync hasn't settled it yet, worth an eye.
+            if manual_rows[slug] & {"open", "pending"}:
+                print(f"  (manual trade {slug} resolved on exchange but its row is "
+                      f"still open — the next manual sync should close it)")
+            else:
+                skipped_manual += 1
+            continue
         upd = str(pr.get("updateTime") or a.get("updateTime") or "").replace("Z", "+00:00")
         if upd and upd < cutoff:
             skipped_precutoff += 1
@@ -127,6 +150,8 @@ for a in activities:
         mismatched.append(slug)
 if skipped_precutoff:
     print(f"  ({skipped_precutoff} pre-cutover resolutions skipped — other bot's history)")
+if skipped_manual:
+    print(f"  ({skipped_manual} resolutions skipped — tracked in manual_trades, already closed)")
 if activities and not FLAGS:
     print("  all resolutions matched — good")
 
