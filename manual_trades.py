@@ -170,6 +170,25 @@ def cmd_cancel(args):
     _close_trade(args.id, "cancelled", None, args.pnl, args.reason or "cancelled", args.notes)
 
 
+def cmd_sync(_args):
+    """Force an immediate reconcile of every open manual trade (and detect
+    hand cash-outs of bot positions) against the exchange — the same pass the
+    bot loop runs every MANUAL_SYNC_INTERVAL_MIN. Run this ON THE SERVER: it
+    needs the live positions.db and exchange auth."""
+    db_init()
+    import config
+    import manual_sync
+    from polymarket_us import PolymarketUS
+    if not getattr(config, "LIVE", False):
+        print("config.LIVE is False — manual sync only makes sense against the live account")
+        return
+    auth = PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY)
+    cashed, closed = manual_sync.detect_manual_cashouts(auth), manual_sync.sync_open_manual_trades(auth)
+    print(f"bot positions cashed out by hand: {len(cashed)}")
+    print(f"manual trades closed this pass:   {closed}")
+    print("done — review with: python manual_trades.py list")
+
+
 def cmd_report(_args):
     db_init()
     total = db(
@@ -256,6 +275,10 @@ def parser() -> argparse.ArgumentParser:
 
     report = sub.add_parser("report", help="manual trade summary")
     report.set_defaults(func=cmd_report)
+
+    sync = sub.add_parser("sync", help="reconcile open manual trades + bot cash-outs "
+                                       "against the exchange now (run on the server)")
+    sync.set_defaults(func=cmd_sync)
     return p
 
 

@@ -80,7 +80,16 @@ def db_init():
                        ("rescheduled_at", "TEXT"),
                        ("closing_price", "REAL"), ("closing_captured_at", "TEXT"),
                        ("pnl_reconciled", "INTEGER DEFAULT 0"),
-                       ("cancel_verified", "INTEGER DEFAULT 0")):
+                       ("cancel_verified", "INTEGER DEFAULT 0"),
+                       # Manual (hand-placed) activity the operator does on a
+                       # BOT position: contracts they sold/covered by hand
+                       # (a partial or full cash-out), contracts they added by
+                       # hand, the P&L those hand exits banked, and why the row
+                       # closed. manual_sync.detect_manual_cashouts owns these.
+                       ("manual_sold_qty", "REAL DEFAULT 0"),
+                       ("manual_added_qty", "REAL DEFAULT 0"),
+                       ("cashout_pnl", "REAL DEFAULT 0"),
+                       ("close_reason", "TEXT")):
         if name not in have:
             con.execute(f"ALTER TABLE positions ADD COLUMN {name} {decl}")
     con.execute(
@@ -116,6 +125,12 @@ def db_init():
             notes TEXT
         )"""
     )
+    # Migration: manual_trades needs is_long so manual_sync can record whether
+    # a hand-placed bet is a long (bought) or short (sold-to-open) position —
+    # the exchange nets both, and a short's cash math is the mirror of a long's.
+    have_manual = {r[1] for r in con.execute("PRAGMA table_info(manual_trades)")}
+    if "is_long" not in have_manual:
+        con.execute("ALTER TABLE manual_trades ADD COLUMN is_long INTEGER DEFAULT 1")
     # Paper-only ledger for every valid model signal, including signals the
     # live risk policy declines. It must stay separate from `positions`: no
     # signal can consume bankroll, open slots, or affect real P&L/reporting.
