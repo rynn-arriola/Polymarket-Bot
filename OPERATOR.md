@@ -285,6 +285,19 @@ Then, off the back of those:
 ## 6. What's automatic (never action these)
 
 - Market scan, entries, fill confirmation, cancels: every **60 s**.
+- The market **catalog** (the ~9,000-market list) refetches every
+  **10 min** (`MARKET_LIST_REFRESH_MIN`), paced, and is reused in between —
+  it's discovery metadata only; **entry prices always come from a fresh
+  per-market bbo call every cycle.** This is the rate-limit fix; see
+  [History](#11-history-incidents-and-what-they-taught).
+- Cloudflare-ban circuit breaker: if the exchange answers with a ban page
+  (error 1015), all exchange calls pause `API_BAN_COOLDOWN_MIN = 5` min so
+  the ban can expire, instead of hammering through and extending it. Expect
+  the log line "Cloudflare ban cooldown"; positions are safe while paused.
+- Reconcile give-up: a settled row whose resolution activity still hasn't
+  appeared `RECONCILE_GIVE_UP_DAYS = 3` days after settlement keeps its
+  estimated P&L as final (the exchange never posts one for some markets —
+  otherwise the row polls the feed every cycle forever).
 - Unfilled orders cancelled after **10 min** (`CANCEL_UNFILLED_AFTER_MIN`).
   `confirm_fills` **never** cancels on absence — giving up is solely
   `cancel_stale_orders`' job. This is load-bearing; see
@@ -498,6 +511,17 @@ both cost real money, and both look like over-engineering until you know why.
   overstated 16 settled rows by ~$10.6. Fix: `RESOLUTION_STABLE_MINUTES = 45`.
 - **The silently-inert model (2026-07-14).** See the XGB trap in
   [section 8](#8-the-models).
+- **The Cloudflare ban (2026-07-16).** api.polymarket.us banned the droplet
+  for ~3 h (error 1015, "banned you temporarily"). Cause: the full market
+  catalog (~9,000 markets = ~90 paginated calls in a ~6 s burst) was refetched
+  **every 60 s cycle**; a busy match window stacked settlement and CLV calls
+  on top and tipped it over Cloudflare's burst limit. No money was lost —
+  every check failed loudly and concluded nothing (the fail-open design), and
+  all ten affected positions settled and reconciled correctly after the ban
+  lifted. Fixes: the catalog is now cached and refetched every 10 min with
+  paced pagination (prices were never in the catalog — they come from
+  per-market bbo calls, still every cycle), and a ban-page answer now pauses
+  all exchange calls for 5 min (`api_guard.py`) instead of hammering through.
 
 ---
 
@@ -586,6 +610,7 @@ handle it. Paste the output.
 | `pull_server_state.py` | **daily.** Pulls live DB + server ratings DOWN into `server_mirror/`. One-way; the only backup of the live money record. |
 | `repair_miscancelled.py` | standing repair tool for wrongly-cancelled rows |
 | `name_match.py` | Polymarket name → Elo name resolution (exact → alias → fuzzy) |
+| `api_guard.py` | Cloudflare-ban detection + cooldown (the rate-limit circuit breaker) |
 | `elo/` | the rating engines — `engine`, `basketball`, `tennis`, `mlb`, `soccer`, `esports`, `lol_players`, `rosters`, `injuries`, `history`, `params` |
 | `xgb_live.py` | the **gated** XGBoost override + shared feature builders |
 | `train_xgb.py`, `xgb_features.py` | XGBoost training + walk-forward extractors |

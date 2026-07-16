@@ -311,6 +311,32 @@ REPORT_TIMEZONE = "America/New_York"
 SCAN_INTERVAL_SECONDS = 60
 CANCEL_UNFILLED_AFTER_MIN = 10
 
+# --- API rate-limit protection (added after the 2026-07-16 Cloudflare ban) ---
+# The full active-market catalog (~9,000 markets = ~90 paginated calls) was
+# refetched in a tight burst EVERY cycle — the dominant API load by far, and
+# what got the droplet temporarily banned (Cloudflare 1015). The catalog is
+# only DISCOVERY metadata (slugs, teams, start times); entry prices always
+# come from a fresh per-market bbo call each cycle, so the catalog can be
+# refreshed slowly and reused in between without staling any price.
+MARKET_LIST_REFRESH_MIN = 10   # catalog refetch cadence (0 = refetch every cycle)
+MARKET_LIST_MAX_AGE_MIN = 60   # if refetches keep FAILING, stop serving a catalog
+                               # older than this (skip discovery; stale start
+                               # times could mislabel a postponed match pregame)
+MARKET_PAGE_SPACING_SEC = 0.25 # pause between catalog pagination calls
+                               # (~90-call burst in ~6s -> a drip over ~30s)
+# If the exchange answers with a Cloudflare BAN page anyway, pause all
+# exchange calls this long so the ban can expire — hammering through resets
+# Cloudflare's rolling window and extends it. Pausing is safe: fills,
+# settlements, and reconciliation all catch up when calls resume (proven
+# during the 3h ban on 2026-07-16 — zero money lost).
+API_BAN_COOLDOWN_MIN = 5
+# A settled row whose POSITION_RESOLUTION never appears on the activity feed
+# (exchange quirk — a won MLB row from 2026-07-12 and a voided dota2 push
+# both never got one) can never reconcile; without a give-up, each such row
+# polls the feed every cycle FOREVER (1,440 calls/day each). After this many
+# days the estimated P&L is kept as final. 0 disables the give-up.
+RECONCILE_GIVE_UP_DAYS = 3
+
 # --- Rescheduled-match hold marker ---
 # A filled position whose match gets POSTPONED stays open so we don't pay an
 # early-exit fee just to free a slot. Once a position is this many hours past
