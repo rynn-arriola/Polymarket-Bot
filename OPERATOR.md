@@ -600,7 +600,7 @@ handle it. Paste the output.
 | File | What it is |
 |---|---|
 | `divergence_bot.py` | the main loop: scan → evaluate → order → confirm → settle. Also `status`, `discover`, `errors` subcommands. |
-| `config.py` | **every knob.** The money rules live here. Not in git (secrets); `credentials.example.py` is the template. |
+| `config.py` | **every knob.** The money rules live here. Tracked in git — it holds only `_secret()` lookups, never a literal secret. The real keys live in `credentials.py` (gitignored; `credentials.example.py` is the template). |
 | `risk.py` | sizing, position caps, daily loss brake |
 | `db.py` | `positions.db` schema + migrations (SQLite, WAL) |
 | `reporting.py` | Discord embeds: status, settlements, daily digest, CLV, paper CLV |
