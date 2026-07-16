@@ -25,7 +25,8 @@ So realized P&L never comes from our arithmetic anymore; it comes from the
 exchange. We only use `action` to tell held-vs-flat and to label the entry.
 
 Shared by divergence_bot.py (per-cycle pass) and manual_trades.py (ad-hoc
-`sync` subcommand). Imports only config/db/reporting — never the Elo stack.
+`sync` subcommand). Imports only config/db/reporting/api_guard — never the
+Elo stack.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
+import api_guard
 import config
 import reporting
 from db import db
@@ -99,6 +101,7 @@ def resolution_pnl(auth, slug: str):
             "limit": 1,
         })
     except Exception as e:
+        api_guard.note_error(e)
         log.warning(f"Resolution-activity check failed for {slug}: {e}")
         return RESOLUTION_CHECK_FAILED
     if not isinstance(resp, dict) or "activities" not in resp:
@@ -149,6 +152,7 @@ def manual_fills(auth, slug: str, since=None):
             "limit": 100,
         })
     except Exception as e:
+        api_guard.note_error(e)
         log.warning(f"Manual-fill fetch failed for {slug}: {e}")
         return None
     if not isinstance(resp, dict) or "activities" not in resp:

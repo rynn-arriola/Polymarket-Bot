@@ -24,6 +24,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+import api_guard
 import config
 import manual_sync
 import name_match
@@ -185,32 +186,68 @@ def inside_entry_window(market: dict) -> bool:
     return now <= start <= now + timedelta(minutes=minutes)
 
 
+# The catalog is DISCOVERY metadata only (slugs, teams, start times) — every
+# entry price comes from a fresh per-market bbo call in evaluate_market, and
+# reschedule handling re-reads its market by slug itself. So the catalog can
+# be refreshed on a slow cadence and reused in between without staling any
+# decision. Refetching it every cycle (~90 paginated calls in a ~6 s burst)
+# is what got the droplet Cloudflare-banned on 2026-07-16.
+_MARKET_CATALOG = {"at": 0.0, "markets": []}
+
+
 def fetch_all_markets(client) -> list:
+    refresh_min = getattr(config, "MARKET_LIST_REFRESH_MIN", 10)
+    age = time.monotonic() - _MARKET_CATALOG["at"]
+    if _MARKET_CATALOG["markets"] and refresh_min and age < refresh_min * 60:
+        return _MARKET_CATALOG["markets"]
+
+    spacing = getattr(config, "MARKET_PAGE_SPACING_SEC", 0.25)
     markets, offset = [], 0
-    while True:
-        params = {"limit": 100, "offset": offset, "active": True, "closed": False}
-        paginated = True
-        try:
-            page = client.markets.list(params)
-        except TypeError:
-            page = client.markets.list({"limit": 100, "active": True})
-            paginated = False
-        batch = page.get("markets", page) if isinstance(page, dict) else page
-        if not batch:
-            break
-        markets.extend(batch)
-        if not paginated:
-            # The offset param was rejected — without it every iteration would
-            # refetch this same first page, so stop after one.
-            log.warning("markets.list rejected pagination params — only the first page was fetched")
-            break
-        if len(batch) < 100:
-            break
-        offset += 100
-        if offset >= 20000:
-            log.warning("Pagination cap hit at 20000 — market list may be incomplete")
-            break
-    log.info(f"Fetched {len(markets)} active markets")
+    try:
+        while True:
+            params = {"limit": 100, "offset": offset, "active": True, "closed": False}
+            paginated = True
+            try:
+                page = client.markets.list(params)
+            except TypeError:
+                page = client.markets.list({"limit": 100, "active": True})
+                paginated = False
+            batch = page.get("markets", page) if isinstance(page, dict) else page
+            if not batch:
+                break
+            markets.extend(batch)
+            if not paginated:
+                # The offset param was rejected — without it every iteration would
+                # refetch this same first page, so stop after one.
+                log.warning("markets.list rejected pagination params — only the first page was fetched")
+                break
+            if len(batch) < 100:
+                break
+            offset += 100
+            if offset >= 20000:
+                log.warning("Pagination cap hit at 20000 — market list may be incomplete")
+                break
+            if spacing:
+                time.sleep(spacing)  # a drip, not a burst — Cloudflare limits on burst rate
+    except Exception as e:
+        api_guard.note_error(e)
+        max_age = getattr(config, "MARKET_LIST_MAX_AGE_MIN", 60) * 60
+        if _MARKET_CATALOG["markets"] and age < max_age:
+            log.warning(f"markets.list failed ({e}) — reusing catalog from "
+                        f"{age / 60:.0f} min ago until a refetch succeeds")
+            return _MARKET_CATALOG["markets"]
+        # Too stale to trust: cached start times could mislabel a postponed
+        # match as pregame. Skipping discovery is the fail-safe (no entries).
+        log.warning(f"markets.list failed ({e}) and no recent catalog — skipping discovery this cycle")
+        return []
+    if markets:
+        _MARKET_CATALOG.update(at=time.monotonic(), markets=markets)
+        log.info(f"Fetched {len(markets)} active markets (catalog cached "
+                 f"{refresh_min} min; prices stay per-cycle via bbo)")
+    else:
+        # An empty page-1 answer is more likely a hiccup than a world with no
+        # markets — don't cache it, retry next cycle.
+        log.warning("markets.list answered with zero markets — not caching, will refetch next cycle")
     return markets
 
 
@@ -778,6 +815,7 @@ def guard_untracked_exchange_state(auth):
         # decision paths that must be exact use _position_quantity instead.
         _collect_slugs(auth.portfolio.positions(), exchange_slugs)
     except Exception as e:
+        api_guard.note_error(e)
         log.warning(f"Could not sweep exchange state for untracked orders: {e}")
         return
     if not exchange_slugs:
@@ -883,6 +921,9 @@ def scan_once(pub, auth, engines: dict[str, EloEngine]):
         try:
             cand = evaluate_market(pub, m, engines, fwc_groups)
         except Exception as e:
+            if api_guard.note_error(e):
+                log.warning("ban page during market evaluation — abandoning this scan")
+                break  # every further bbo call would hit the same ban
             log.warning(f"error evaluating market {market_slug(m)}: {e}")
             continue
         if not cand:
@@ -1612,12 +1653,34 @@ def reconcile_live_pnl(client):
     if not config.LIVE:
         return
     rows = db(
-        """SELECT id, market_slug FROM positions
+        """SELECT id, market_slug, settled_at, pnl FROM positions
            WHERE live=1 AND pnl_reconciled=0 AND status IN ('won','lost','push')""",
         fetch=True,
     )
-    for pid, slug in rows:
+    give_up_days = getattr(config, "RECONCILE_GIVE_UP_DAYS", 3)
+    for pid, slug, settled_at, est_pnl in rows:
         res = _resolution_pnl(client, slug)
+        if res is None and give_up_days and settled_at:
+            # The feed ANSWERED: no resolution activity exists (exchange
+            # quirk on some markets — it never posts one). Old enough means
+            # it never will; without a give-up this row polls the feed every
+            # cycle forever. Keep the estimate as final. A FAILED check
+            # (RESOLUTION_CHECK_FAILED) never lands here — that must retry.
+            try:
+                settled = datetime.fromisoformat(settled_at)
+                if settled.tzinfo is None:
+                    settled = settled.replace(tzinfo=timezone.utc)
+                age_days = (datetime.now(timezone.utc) - settled).total_seconds() / 86400
+            except (TypeError, ValueError):
+                age_days = None
+            if age_days is not None and age_days >= give_up_days:
+                db("UPDATE positions SET pnl_reconciled=1 WHERE id=?", (pid,))
+                est_label = f"{est_pnl:+.2f}" if est_pnl is not None else "unknown"
+                log.warning(
+                    f"Reconcile GIVE-UP {slug}: no resolution activity "
+                    f"{age_days:.0f}d after settlement (exchange never posted "
+                    f"one) — keeping estimated P&L {est_label} as final")
+            continue
         if not isinstance(res, tuple):
             continue  # not posted yet / check failed — retry next cycle
         real_pnl, stable = res
@@ -1740,6 +1803,15 @@ def cmd_run():
 
     while True:
         try:
+            # Cloudflare-ban circuit breaker: when the exchange has answered
+            # with a ban page (error 1015), calling through the ban resets
+            # its rolling window and extends it. Wait it out instead — every
+            # step below fails loudly and concludes nothing during a ban
+            # anyway (proven live, 2026-07-16).
+            cooldown = api_guard.cooldown_remaining()
+            if cooldown:
+                log.warning(f"Cloudflare ban cooldown — exchange calls paused {cooldown:.0f}s")
+                time.sleep(cooldown)
             scan_once(pub, auth, engines)
             confirm_fills(auth)
             capture_closing_lines(pub)
@@ -1783,6 +1855,7 @@ def cmd_run():
             log.info("Shutting down (Ctrl+C)")
             break
         except Exception as e:
+            api_guard.note_error(e)
             log.error(f"Cycle error: {e}", exc_info=True)
         time.sleep(getattr(config, "SCAN_INTERVAL_SECONDS", 60))
 
