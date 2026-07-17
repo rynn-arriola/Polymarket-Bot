@@ -66,8 +66,9 @@ live 2026-07-16):
       `load_dota_games()` reader). 300 lineup calls/run, 4 runs/day + walk
       stays under OpenDota's 2000/day. ~18mo backfill completes in ~3-4 weeks.
       Verified live (5 lineups, full 5v5, correct winner attribution; ps store
-      untouched). **[ ] Needs merge to main + deploy before it accumulates on
-      the server** — collection-only, nothing live reads it.
+      untouched). **[x] Merged to main + DEPLOYED 2026-07-16 (merge ee1754d,
+      parity IN SYNC)** — collection runs in every 6h refresh; backfill ETA
+      ~3-4 weeks. Next: check `esports_dota2_lineups.json` growth in a week.
 - [ ] **cs2 — source FOUND, collector not built**: bo3.gg match detail
       (`/api/v1/matches/{slug}?with=players`) returns the true historical
       10-player lineup keyless (verified on a 2020 match: real shox/kennyS-era
