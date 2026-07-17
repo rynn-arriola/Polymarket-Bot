@@ -69,15 +69,15 @@ live 2026-07-16):
       untouched). **[x] Merged to main + DEPLOYED 2026-07-16 (merge ee1754d,
       parity IN SYNC)** — collection runs in every 6h refresh; backfill ETA
       ~3-4 weeks. Next: check `esports_dota2_lineups.json` growth in a week.
-- [ ] **cs2 — source FOUND, collector not built**: bo3.gg match detail
-      (`/api/v1/matches/{slug}?with=players`) returns the true historical
-      10-player lineup keyless (verified on a 2020 match: real shox/kennyS-era
-      G2/Vitality). CATCH: each player's `team_id` is his CURRENT team, so
-      sides can't be split on old matches → **backfill impossible,
-      forward-only collection works** (capture within days of the match while
-      team_id is still true; the store walk already runs every 6h). Bonus
-      column: `six_month_avg_rating` per player — a real skill feature. Build
-      as the next collector.
+- [x] **cs2 collector BUILT + DEPLOYED 2026-07-16** (merge a48c4fc, parity IN
+      SYNC): forward-only bo3.gg lineup collection (the LIST endpoint carries
+      all 10 players/row — no per-match calls) into
+      `esports_cs2_lineups.json`, 30-day age window, tier s-c,
+      `load_cs2_games()` reader. First server run: +453 lineups. Backfill
+      remains impossible (player `team_id` = CURRENT team; verified on a 2020
+      match) so the store grows only forward (~1.5k matches/month). Bonus
+      column noted for later: `six_month_avg_rating` per player — a real
+      skill feature.
 - [ ] **valorant — NO free per-match player source**: vlr mirror has no
       match-detail endpoint (404), results rows carry no players; PandaScore
       free tier has none (per-game detail 403) and paid stats plans are
