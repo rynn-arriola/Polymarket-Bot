@@ -667,47 +667,91 @@ def recent_match_dates(title: str, team_name: str) -> list[str]:
     return out
 
 
-DOTA_ROSTER_CALLS_PER_RUN = 80  # OpenDota free tier is 2000/day; stay polite
+DOTA_LINEUP_CALLS_PER_RUN = 300  # OpenDota free tier is 2000/day; the id walk
+                                  # plus 4 refresh runs/day of lineups stays under it
 
 
-def capture_dota_rosters():
-    """Accumulates per-match LINEUPS for stored Dota matches (newest first),
-    capped per run — groundwork for a future Dota player-level Elo (the
-    LoL pilot's approach needs per-match rosters, and OpenDota only serves
-    them one match per call). Run daily via build_ratings.py, this collects
-    ~80 matches/run: recent history fills in within weeks. Sidecar store:
-    {match_id: {"radiant": [account_ids], "dire": [...]}}."""
-    path = STORE_DIR / "esports_dota2_rosters.json"
+def deepen_dota_player_data():
+    """Data collection for a future Dota player model (the LoL player blend —
+    the one model that ever beat Elo here — needs per-match lineups, and its
+    approach is the template). PandaScore's free tier carries no players and
+    its paid stats plans are restricted to non-betting usage, so lineups come
+    from keyless OpenDota instead: walk proMatches into a SEPARATE
+    OpenDota-id store (the live match store is PandaScore ids — a different
+    id-space, deliberately never joined), then fetch each match's lineup.
+    The OD store carries its own dates/results, so the future model trains
+    entirely on OpenDota data. Collection only — nothing live reads it."""
+    if pandascore_enabled("dota2"):
+        store = _load_store("dota2_od")
+        before = len(store)
+        try:
+            # teams=None: OpenDota team ids must never leak into the
+            # PandaScore team-id sidecar (different id-space).
+            added = _fetch_dota2(store, None)
+        except Exception as e:
+            log.warning(f"dota2_od walk failed ({e}) — keeping {before} stored matches")
+            added = 0
+        if added:
+            _save_store("dota2_od", store)
+        log.info(f"DOTA2 player-data walk: {len(store)} OpenDota matches (+{added} new)")
+    else:
+        store = _load_store("dota2")  # tokenless install: the main store IS OpenDota ids
+    capture_dota_lineups(store)
+
+
+def capture_dota_lineups(store: dict):
+    """Accumulates per-match LINEUPS for OpenDota-id matches (newest first,
+    capped per run — OpenDota serves lineups one match per call). Entries
+    mirror lol_players' game shape so the future training harness is
+    source-agnostic: {match_id: {date, teams: {name: [account_ids]},
+    winner}}. A valid match response is always recorded, even with a partial
+    lineup, so it's never refetched (training filters thin lineups); a
+    failed fetch is skipped and retried on a later run."""
+    path = STORE_DIR / "esports_dota2_lineups.json"
     try:
         with open(path, encoding="utf-8") as f:
-            rosters = json.load(f)
+            lineups = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        rosters = {}
-    store = _load_store("dota2")
-    # Only OpenDota-sourced (numeric) match ids can be looked up on OpenDota;
-    # after a PandaScore cutover the store holds 'ps*' ids and this capture
-    # idles (the future player model would need a PandaScore lineup source).
-    todo = sorted((mid for mid in store if mid not in rosters and str(mid).isdigit()),
-                  key=lambda mid: store[mid][0], reverse=True)[:DOTA_ROSTER_CALLS_PER_RUN]
+        lineups = {}
+    todo = sorted((mid for mid in store if mid not in lineups and str(mid).isdigit()),
+                  key=lambda mid: store[mid][0], reverse=True)[:DOTA_LINEUP_CALLS_PER_RUN]
     fetched = 0
     for mid in todo:
         data = history._get_json(f"https://api.opendota.com/api/matches/{mid}", timeout=25)
-        if not data:
-            continue
+        time.sleep(1.1)  # also on failure — a dead endpoint must not get hammered
+        if not data or data.get("radiant_win") is None:
+            continue  # transient failure / unresolved match — retry next run
         radiant = [str(pl["account_id"]) for pl in data.get("players", [])
                    if pl.get("isRadiant") and pl.get("account_id")]
         dire = [str(pl["account_id"]) for pl in data.get("players", [])
                 if not pl.get("isRadiant") and pl.get("account_id")]
-        if radiant or dire:
-            rosters[mid] = {"radiant": radiant, "dire": dire}
-            fetched += 1
-        time.sleep(1.1)
+        game_date, winner, loser = store[mid][0], store[mid][1], store[mid][2]
+        win_lu, lose_lu = (radiant, dire) if data["radiant_win"] else (dire, radiant)
+        lineups[mid] = {"date": game_date, "teams": {winner: win_lu, loser: lose_lu},
+                        "winner": winner}
+        fetched += 1
     if fetched:
         STORE_DIR.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(rosters, f)
-    log.info(f"dota2 roster capture: +{fetched} this run, {len(rosters)} total "
-             f"({len(store) - len(rosters)} still unrostered)")
+            json.dump(lineups, f)
+    log.info(f"dota2 lineup capture: +{fetched} this run, {len(lineups)} total "
+             f"({len(store) - len(lineups)} still uncaptured)")
+
+
+def load_dota_games() -> list[dict]:
+    """Captured Dota games in lol_players' game shape ({date, teams, winner}),
+    filtered to full two-sided lineups (>=3 known players a side — the same
+    rule as the LoL OE loader): the future player model's training reader."""
+    try:
+        with open(STORE_DIR / "esports_dota2_lineups.json", encoding="utf-8") as f:
+            lineups = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    games = [g for g in lineups.values()
+             if len(g.get("teams", {})) == 2 and g.get("winner") in g.get("teams", {})
+             and all(len(v) >= 3 for v in g["teams"].values())]
+    games.sort(key=lambda g: g["date"])
+    return games
 
 
 def _apply_inactivity_decay(engine: EloEngine, team: str, game_day, last_played: dict, p: dict):

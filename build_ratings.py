@@ -62,8 +62,12 @@ def build_all(sports: list[str] | None = None):
             out[title] = engine.to_dict()
             _record(freshness, title, engine, n, esports.store_latest_date(title))
             if title == "dota2":
-                # accumulate per-match lineups for the future player model
-                esports.capture_dota_rosters()
+                # accumulate OpenDota match ids + per-match lineups for the
+                # future player model (collection only; nothing live reads it)
+                try:
+                    esports.deepen_dota_player_data()
+                except Exception as e:
+                    log.warning(f"dota2 player-data collection skipped: {e}")
             if title == "lol":
                 # LoL player-level model sidecar (Oracle's Elixir); goes live
                 # for LoL automatically once its data is fresh (see config).
