@@ -312,6 +312,12 @@ Then, off the back of those:
 - Ratings/data refresh: every **6 h**, as a background subprocess, hot-reloaded
   without a restart. Trading never pauses; a hung rebuild can't take the bot
   down (last-good ratings stay live).
+- Dota player-data collection: each refresh also walks OpenDota pro matches
+  into a separate store and captures up to 300 per-match lineups
+  (`data/cache/esports_dota2_lineups.json`) — groundwork for a future Dota
+  player model (see the XGBoost status in section 8). Adds ~5–10 min inside
+  the background refresh, stays under OpenDota's 2,000-calls/day free tier.
+  **Collection only — no live trading path reads it.**
 - Ratings freshness guard: a sport whose ratings haven't rebuilt in
   `RATINGS_STALE_HOURS = 24` is **skipped**, not traded on stale numbers.
 - CLV capture: final minutes before every game start.
@@ -396,6 +402,25 @@ grep -i "XGB lol" divergence_bot.log | tail -1   # want: "XGB lol ACTIVE"
 > sport quietly trades on Elo. **When activating any XGB sport, verify
 > `requirements.txt` ships its deps AND that they're installed on the server's
 > system python.**
+
+### Where the XGBoost program stands (2026-07-16)
+
+**Research on free data is COMPLETE (closed 2026-07-13).** All 10 sports were
+baselined; XGBoost on existing features ties Elo everywhere, and recency
+weighting + esports context features are dead (section 9). The LoL player
+blend was the sole winner and went live 2026-07-14. The full experiment
+ledger (`MODELS_TODO.md`, plan/protocol docs) lives on the **`xgboost-dev`
+branch**, which never merges to main without explicit approval.
+
+**The active program is player-data collection** — the "new data wins"
+pattern applied to the sports where roster churn hurts most:
+
+| Title | Player data | Status |
+|---|---|---|
+| LoL | Oracle's Elixir CSVs | **have it** — powers the live blend |
+| Dota 2 | OpenDota per-match lineups | **collector live in the 6h refresh** — ~18-month backfill completes in ~3–4 weeks; a player model becomes trainable (on xgboost-dev, activated only via the usual XGB gates) once the store is deep |
+| CS2 | bo3.gg per-match players | source verified real (even for old matches) but players carry only their *current* team → sides unsplittable historically → **forward-only collector, not yet built** |
+| Valorant | none | probed 2026-07-16: no free per-match source; PandaScore's paid stats plans are restricted to non-betting usage |
 
 ### Name matching — the highest-maintenance part of the system
 
