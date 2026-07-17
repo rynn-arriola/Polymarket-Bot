@@ -312,12 +312,13 @@ Then, off the back of those:
 - Ratings/data refresh: every **6 h**, as a background subprocess, hot-reloaded
   without a restart. Trading never pauses; a hung rebuild can't take the bot
   down (last-good ratings stay live).
-- Dota player-data collection: each refresh also walks OpenDota pro matches
-  into a separate store and captures up to 300 per-match lineups
-  (`data/cache/esports_dota2_lineups.json`) — groundwork for a future Dota
-  player model (see the XGBoost status in section 8). Adds ~5–10 min inside
-  the background refresh, stays under OpenDota's 2,000-calls/day free tier.
-  **Collection only — no live trading path reads it.**
+- Player-data collection (Dota 2 + CS2): each refresh also captures per-match
+  lineups — Dota from OpenDota (up to 300/run into
+  `data/cache/esports_dota2_lineups.json`; ~5–10 min inside the background
+  refresh, under OpenDota's 2,000-calls/day free tier) and CS2 from bo3.gg
+  (`esports_cs2_lineups.json`; forward-only, last-30-days window, a handful
+  of calls). Groundwork for future player models (see the XGBoost status in
+  section 8). **Collection only — no live trading path reads either.**
 - Ratings freshness guard: a sport whose ratings haven't rebuilt in
   `RATINGS_STALE_HOURS = 24` is **skipped**, not traded on stale numbers.
 - CLV capture: final minutes before every game start.
@@ -419,7 +420,7 @@ pattern applied to the sports where roster churn hurts most:
 |---|---|---|
 | LoL | Oracle's Elixir CSVs | **have it** — powers the live blend |
 | Dota 2 | OpenDota per-match lineups | **collector live in the 6h refresh** — ~18-month backfill completes in ~3–4 weeks; a player model becomes trainable (on xgboost-dev, activated only via the usual XGB gates) once the store is deep |
-| CS2 | bo3.gg per-match players | source verified real (even for old matches) but players carry only their *current* team → sides unsplittable historically → **forward-only collector, not yet built** |
+| CS2 | bo3.gg per-match players | **forward-only collector live in the 6h refresh (since 2026-07-16)** — players carry only their *current* team, so history can't be side-split: the store grows only from deploy day (~1.5k tier s–c matches/month) |
 | Valorant | none | probed 2026-07-16: no free per-match source; PandaScore's paid stats plans are restricted to non-betting usage |
 
 ### Name matching — the highest-maintenance part of the system

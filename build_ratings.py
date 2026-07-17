@@ -68,6 +68,12 @@ def build_all(sports: list[str] | None = None):
                     esports.deepen_dota_player_data()
                 except Exception as e:
                     log.warning(f"dota2 player-data collection skipped: {e}")
+            if title == "cs2":
+                # forward-only bo3.gg lineup collection (same purpose as dota2)
+                try:
+                    esports.deepen_cs2_player_data()
+                except Exception as e:
+                    log.warning(f"cs2 player-data collection skipped: {e}")
             if title == "lol":
                 # LoL player-level model sidecar (Oracle's Elixir); goes live
                 # for LoL automatically once its data is fresh (see config).

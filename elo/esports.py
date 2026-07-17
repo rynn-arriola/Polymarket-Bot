@@ -738,12 +738,12 @@ def capture_dota_lineups(store: dict):
              f"({len(store) - len(lineups)} still uncaptured)")
 
 
-def load_dota_games() -> list[dict]:
-    """Captured Dota games in lol_players' game shape ({date, teams, winner}),
-    filtered to full two-sided lineups (>=3 known players a side — the same
-    rule as the LoL OE loader): the future player model's training reader."""
+def _lineup_games(filename: str) -> list[dict]:
+    """A lineup store's games in lol_players' game shape ({date, teams,
+    winner}), filtered to full two-sided lineups (>=3 known players a side —
+    the same rule as the LoL OE loader): the player-model training reader."""
     try:
-        with open(STORE_DIR / "esports_dota2_lineups.json", encoding="utf-8") as f:
+        with open(STORE_DIR / filename, encoding="utf-8") as f:
             lineups = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return []
@@ -752,6 +752,98 @@ def load_dota_games() -> list[dict]:
              and all(len(v) >= 3 for v in g["teams"].values())]
     games.sort(key=lambda g: g["date"])
     return games
+
+
+def load_dota_games() -> list[dict]:
+    return _lineup_games("esports_dota2_lineups.json")
+
+
+def load_cs2_games() -> list[dict]:
+    return _lineup_games("esports_cs2_lineups.json")
+
+
+# CS2 lineups: bo3.gg's match LIST endpoint carries all 10 players per row
+# (~100 matches/call, keyless). Attribution is self-validating — each player
+# row's team_id either matches one of the two match teams or the player is
+# dropped — but that team_id is the player's CURRENT membership, so it is
+# only trustworthy near match time. Hence FORWARD-ONLY collection with an
+# age window; no historical backfill is possible (a 2023 match's players
+# carry 2026 team_ids — verified live 2026-07-16, ledgered in MODELS_TODO
+# on xgboost-dev).
+BO3_PLAYERS_URL = ("https://api.bo3.gg/api/v1/matches?filter%5Bmatches.status%5D%5Beq%5D=finished"
+                   "&sort=-start_date&with=teams,players&page%5Blimit%5D=100&page%5Boffset%5D={offset}")
+CS2_LINEUP_MAX_AGE_DAYS = 30  # beyond this, transfers erode lineups (players
+                              # drop out of the split; never misattributed)
+CS2_LINEUP_MAX_CALLS = 60     # covers the ~30-day window on the first run;
+                              # incremental runs early-stop in known territory
+
+
+def deepen_cs2_player_data():
+    """Forward-only CS2 lineup collection into esports_cs2_lineups.json,
+    same game shape as the Dota/LoL stores ({date, teams: {name:
+    [player_ids]}, winner}). Tier filter matches the rating pipeline
+    (CS2_TIERS). A match is recorded once both sides show >=3 attributed
+    players; thinner rows are retried on later runs while they remain
+    inside the age window. Collection only — nothing live reads it."""
+    path = STORE_DIR / "esports_cs2_lineups.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            lineups = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        lineups = {}
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(days=CS2_LINEUP_MAX_AGE_DAYS)).date().isoformat()
+    added, offset, consecutive_known = 0, 0, 0
+    for _ in range(CS2_LINEUP_MAX_CALLS):
+        data = history._get_json(BO3_PLAYERS_URL.format(offset=offset))
+        results = (data or {}).get("results") or []
+        if not results:
+            break
+        eligible_on_page, new_on_page = 0, 0
+        reached_cutoff = False
+        for m in results:
+            start = (m.get("start_date") or "")[:10]
+            if start and start < cutoff:
+                reached_cutoff = True
+                continue
+            if str(m.get("tier") or "").lower() not in CS2_TIERS:
+                continue
+            mid = str(m.get("id"))
+            t1, t2 = m.get("team1") or {}, m.get("team2") or {}
+            id1, id2 = t1.get("id"), t2.get("id")
+            n1, n2 = t1.get("name"), t2.get("name")
+            wid = m.get("winner_team_id")
+            if not (mid and start and n1 and n2 and id1 and id2 and wid in (id1, id2)):
+                continue
+            eligible_on_page += 1
+            if mid in lineups:
+                continue
+            sides: dict = {id1: [], id2: []}
+            for p in m.get("players") or []:
+                if p.get("id") and p.get("team_id") in sides:
+                    sides[p["team_id"]].append(str(p["id"]))
+            if min(len(sides[id1]), len(sides[id2])) < 3:
+                continue  # thin row — retry next run while inside the window
+            winner = n1 if wid == id1 else n2
+            lineups[mid] = {"date": start, "teams": {n1: sides[id1], n2: sides[id2]},
+                            "winner": winner}
+            added += 1
+            new_on_page += 1
+        if reached_cutoff:
+            break
+        if eligible_on_page > 0 and new_on_page == 0:
+            consecutive_known += 1
+            if consecutive_known >= 2 and added > 0:
+                break
+        else:
+            consecutive_known = 0
+        offset += 100
+        time.sleep(0.3)
+    if added:
+        STORE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(lineups, f)
+    log.info(f"cs2 lineup capture: +{added} this run, {len(lineups)} total")
 
 
 def _apply_inactivity_decay(engine: EloEngine, team: str, game_day, last_played: dict, p: dict):
