@@ -201,6 +201,24 @@ def fetch_all_markets(client) -> list:
     if _MARKET_CATALOG["markets"] and refresh_min and age < refresh_min * 60:
         return _MARKET_CATALOG["markets"]
 
+    # Post-ban grace: the catalog refetch (~115 paginated calls) is the
+    # heaviest burst we make, and the cache usually expires DURING a ban
+    # cooldown — so without this, the first post-resume cycle refires the
+    # whole burst at a still-warm rate limiter and gets re-banned in seconds
+    # (the 2026-07-17 ban loop). Serve the cached catalog until the grace
+    # passes; MARKET_LIST_MAX_AGE_MIN still bounds how stale we'll serve.
+    grace_min = getattr(config, "POST_BAN_CATALOG_GRACE_MIN", 10)
+    since_ban = api_guard.seconds_since_ban_end()
+    if grace_min and since_ban is not None and since_ban < grace_min * 60:
+        max_age = getattr(config, "MARKET_LIST_MAX_AGE_MIN", 60) * 60
+        if _MARKET_CATALOG["markets"] and age < max_age:
+            log.info(f"Catalog refetch deferred {grace_min - since_ban / 60:.0f} min "
+                     f"(post-ban grace) — reusing catalog from {age / 60:.0f} min ago")
+            return _MARKET_CATALOG["markets"]
+        log.warning("Post-ban grace active but cached catalog is too stale to serve "
+                    "— skipping discovery this cycle rather than bursting a refetch")
+        return []
+
     spacing = getattr(config, "MARKET_PAGE_SPACING_SEC", 0.25)
     markets, offset = [], 0
     try:

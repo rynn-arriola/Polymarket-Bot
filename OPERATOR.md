@@ -292,8 +292,13 @@ Then, off the back of those:
   [History](#11-history-incidents-and-what-they-taught).
 - Cloudflare-ban circuit breaker: if the exchange answers with a ban page
   (error 1015), all exchange calls pause `API_BAN_COOLDOWN_MIN = 5` min so
-  the ban can expire, instead of hammering through and extending it. Expect
-  the log line "Cloudflare ban cooldown"; positions are safe while paused.
+  the ban can expire, instead of hammering through and extending it. Repeat
+  bans within `API_BAN_RECENT_MIN = 15` min escalate the pause (5 → 10 → 20 →
+  `API_BAN_COOLDOWN_MAX_MIN = 40` min cap), and for
+  `POST_BAN_CATALOG_GRACE_MIN = 10` min after any ban the catalog refetch (the
+  heaviest burst) is deferred in favor of the cached copy. Expect the log
+  lines "Cloudflare ban cooldown" / "Catalog refetch deferred"; positions are
+  safe while paused.
 - Reconcile give-up: a settled row whose resolution activity still hasn't
   appeared `RECONCILE_GIVE_UP_DAYS = 3` days after settlement keeps its
   estimated P&L as final (the exchange never posts one for some markets —
@@ -548,6 +553,21 @@ both cost real money, and both look like over-engineering until you know why.
   paced pagination (prices were never in the catalog — they come from
   per-market bbo calls, still every cycle), and a ban-page answer now pauses
   all exchange calls for 5 min (`api_guard.py`) instead of hammering through.
+- **The Cloudflare ban loop (2026-07-17).** Eleven ban episodes in 2 h
+  (09:35–11:35), no money lost (the circuit breaker paused each time). Two
+  causes, both aftermath of the 07-16 fix being sized for a smaller world:
+  (1) the catalog had grown to ~11,500 markets (~115 pages) and the 0.25 s
+  page spacing still meant a ~4 req/s stream for 30 s — fine in quiet hours,
+  over the limit whenever a busy match window stacked settlement/CLV calls on
+  top (nearly every ban landed seconds after a catalog fetch completed); and
+  (2) the flat 5-min cooldown looped: the catalog cache expired *during* the
+  pause, so the first post-resume cycle refired the full burst at a still-warm
+  rate limiter and was re-banned in seconds — and some resumes hit a
+  still-active ban outright. Fixes: page spacing 0.25 s → 1.0 s (~2 min drip),
+  escalating cooldown on repeat bans (5 → 10 → 20 → 40 min cap,
+  `API_BAN_COOLDOWN_MAX_MIN`), and a 10-min post-ban grace during which the
+  cached catalog is served instead of refetched
+  (`POST_BAN_CATALOG_GRACE_MIN`).
 
 ---
 
