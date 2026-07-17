@@ -24,12 +24,15 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+import api_guard
 import config
+import manual_sync
 import name_match
 import reporting
 import risk
 import xgb_live
 from db import db, db_init, day_open_balance, period_bounds_utc, today
+from manual_sync import RESOLUTION_CHECK_FAILED, resolution_pnl as _resolution_pnl
 from elo import basketball, esports, injuries, mlb, params, rosters, soccer, tennis
 from elo.engine import EloEngine
 
@@ -183,32 +186,68 @@ def inside_entry_window(market: dict) -> bool:
     return now <= start <= now + timedelta(minutes=minutes)
 
 
+# The catalog is DISCOVERY metadata only (slugs, teams, start times) — every
+# entry price comes from a fresh per-market bbo call in evaluate_market, and
+# reschedule handling re-reads its market by slug itself. So the catalog can
+# be refreshed on a slow cadence and reused in between without staling any
+# decision. Refetching it every cycle (~90 paginated calls in a ~6 s burst)
+# is what got the droplet Cloudflare-banned on 2026-07-16.
+_MARKET_CATALOG = {"at": 0.0, "markets": []}
+
+
 def fetch_all_markets(client) -> list:
+    refresh_min = getattr(config, "MARKET_LIST_REFRESH_MIN", 10)
+    age = time.monotonic() - _MARKET_CATALOG["at"]
+    if _MARKET_CATALOG["markets"] and refresh_min and age < refresh_min * 60:
+        return _MARKET_CATALOG["markets"]
+
+    spacing = getattr(config, "MARKET_PAGE_SPACING_SEC", 0.25)
     markets, offset = [], 0
-    while True:
-        params = {"limit": 100, "offset": offset, "active": True, "closed": False}
-        paginated = True
-        try:
-            page = client.markets.list(params)
-        except TypeError:
-            page = client.markets.list({"limit": 100, "active": True})
-            paginated = False
-        batch = page.get("markets", page) if isinstance(page, dict) else page
-        if not batch:
-            break
-        markets.extend(batch)
-        if not paginated:
-            # The offset param was rejected — without it every iteration would
-            # refetch this same first page, so stop after one.
-            log.warning("markets.list rejected pagination params — only the first page was fetched")
-            break
-        if len(batch) < 100:
-            break
-        offset += 100
-        if offset >= 20000:
-            log.warning("Pagination cap hit at 20000 — market list may be incomplete")
-            break
-    log.info(f"Fetched {len(markets)} active markets")
+    try:
+        while True:
+            params = {"limit": 100, "offset": offset, "active": True, "closed": False}
+            paginated = True
+            try:
+                page = client.markets.list(params)
+            except TypeError:
+                page = client.markets.list({"limit": 100, "active": True})
+                paginated = False
+            batch = page.get("markets", page) if isinstance(page, dict) else page
+            if not batch:
+                break
+            markets.extend(batch)
+            if not paginated:
+                # The offset param was rejected — without it every iteration would
+                # refetch this same first page, so stop after one.
+                log.warning("markets.list rejected pagination params — only the first page was fetched")
+                break
+            if len(batch) < 100:
+                break
+            offset += 100
+            if offset >= 20000:
+                log.warning("Pagination cap hit at 20000 — market list may be incomplete")
+                break
+            if spacing:
+                time.sleep(spacing)  # a drip, not a burst — Cloudflare limits on burst rate
+    except Exception as e:
+        api_guard.note_error(e)
+        max_age = getattr(config, "MARKET_LIST_MAX_AGE_MIN", 60) * 60
+        if _MARKET_CATALOG["markets"] and age < max_age:
+            log.warning(f"markets.list failed ({e}) — reusing catalog from "
+                        f"{age / 60:.0f} min ago until a refetch succeeds")
+            return _MARKET_CATALOG["markets"]
+        # Too stale to trust: cached start times could mislabel a postponed
+        # match as pregame. Skipping discovery is the fail-safe (no entries).
+        log.warning(f"markets.list failed ({e}) and no recent catalog — skipping discovery this cycle")
+        return []
+    if markets:
+        _MARKET_CATALOG.update(at=time.monotonic(), markets=markets)
+        log.info(f"Fetched {len(markets)} active markets (catalog cached "
+                 f"{refresh_min} min; prices stay per-cycle via bbo)")
+    else:
+        # An empty page-1 answer is more likely a hiccup than a world with no
+        # markets — don't cache it, retry next cycle.
+        log.warning("markets.list answered with zero markets — not caching, will refetch next cycle")
     return markets
 
 
@@ -782,6 +821,7 @@ def guard_untracked_exchange_state(auth):
         # decision paths that must be exact use _position_quantity instead.
         _collect_slugs(auth.portfolio.positions(), exchange_slugs)
     except Exception as e:
+        api_guard.note_error(e)
         log.warning(f"Could not sweep exchange state for untracked orders: {e}")
         return
     if not exchange_slugs:
@@ -792,76 +832,25 @@ def guard_untracked_exchange_state(auth):
         fetch=True,
     )}
     known = known_bot | known_manual
-    unknown = exchange_slugs - known
-    if unknown:
+    for slug in sorted(exchange_slugs - known):
+        # An exchange slug we don't know: try to import it as a manual trade
+        # (recomputed from its full fill history by manual_sync). Only if that
+        # fails is it a genuine untracked order to block and escalate.
         try:
-            response = auth.portfolio.activities({"limit": 100})
-            activities = response.get("activities") if isinstance(response, dict) else []
-        except Exception as e:
-            log.warning(f"Could not inspect exchange activity for manual trades: {e}")
-            activities = []
-        for slug in unknown:
-            if _import_manual_exchange_trade(slug, activities or []):
+            if manual_sync.import_manual_trade(auth, slug):
                 known.add(slug)
                 known_manual.add(slug)
-    # A manual exchange position is known, but it must still prevent the bot
-    # from placing a second position on the same market.
-    risk._UNTRACKED_SLUGS_THIS_RUN.update(exchange_slugs & known_manual)
-    for slug in sorted(exchange_slugs - known):
+                continue
+        except Exception:
+            log.exception(f"Manual-trade import failed for {slug}")
         if slug not in risk._UNTRACKED_SLUGS_THIS_RUN:
             risk._UNTRACKED_SLUGS_THIS_RUN.add(slug)
             log.critical(f"UNTRACKED exchange position/order on {slug} — present on the "
                          f"exchange but not in positions.db. Blocking bot entries on it; "
                          f"reconcile it manually (cancel it or add a row to positions.db).")
-
-
-def _money_value(value) -> float:
-    try:
-        return float((value or {}).get("value") if isinstance(value, dict) else value)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _import_manual_exchange_trade(slug: str, activities: list[dict]) -> bool:
-    """Import only filled activity explicitly marked manual by the exchange."""
-    fills = []
-    for activity in activities:
-        trade = activity.get("trade") if isinstance(activity, dict) else None
-        execution = (trade or {}).get("aggressorExecution") or {}
-        order = execution.get("order") or (trade or {}).get("aggressor") or {}
-        if (order.get("marketSlug") != slug
-                or order.get("manualOrderIndicator") != "MANUAL_ORDER_INDICATOR_MANUAL"):
-            continue
-        quantity = _money_value((trade or {}).get("qtyDecimal") or (trade or {}).get("qty")
-                                or execution.get("lastShares"))
-        cost = _money_value((trade or {}).get("cost"))
-        fee = _money_value(execution.get("commissionNotionalCollected"))
-        if quantity > 0 and cost > 0:
-            fills.append((trade, order, quantity, cost + fee))
-    if not fills:
-        return False
-    quantity = sum(fill[2] for fill in fills)
-    stake = sum(fill[3] for fill in fills)
-    if quantity <= 0 or stake <= 0:
-        return False
-    trade, order, _, _ = fills[0]
-    meta = order.get("marketMetadata") or trade.get("market") or {}
-    team = meta.get("team") or {}
-    side = meta.get("outcome") or team.get("name") or "manual"
-    sport = str(team.get("league") or "manual").upper()
-    created_at = min(str(fill[0].get("createTime") or "") for fill in fills) or datetime.now(timezone.utc).isoformat()
-    order_ids = ",".join(str(fill[1].get("id")) for fill in fills if fill[1].get("id"))
-    db(
-        """INSERT INTO manual_trades
-           (created_at, updated_at, market_slug, matchup, sport, side, price,
-            quantity, stake, live, order_id, status, notes)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (created_at, datetime.now(timezone.utc).isoformat(), slug,
-         meta.get("title") or slug, sport, side, stake / quantity, quantity,
-         stake, 1, order_ids, "open", "Auto-imported from exchange manual activity."),
-    )
-    log.warning(f"AUTO-IMPORTED manual exchange trade {slug}: ${stake:.2f}")
-    return True
+    # A manual exchange position is known, but it must still prevent the bot
+    # from placing a second position on the same market.
+    risk._UNTRACKED_SLUGS_THIS_RUN.update(exchange_slugs & known_manual)
 
 
 def record_valid_signal(cand: dict, stake: float) -> None:
@@ -938,6 +927,9 @@ def scan_once(pub, auth, engines: dict[str, EloEngine]):
         try:
             cand = evaluate_market(pub, m, engines, fwc_groups)
         except Exception as e:
+            if api_guard.note_error(e):
+                log.warning("ban page during market evaluation — abandoning this scan")
+                break  # every further bbo call would hit the same ban
             log.warning(f"error evaluating market {market_slug(m)}: {e}")
             continue
         if not cand:
@@ -1076,10 +1068,20 @@ def _collect_slugs(obj, out):
 
 
 def _position_quantity(client, slug: str) -> float | None:
-    """Net position held on ONE market, asked with the API's market filter.
-    Returns 0.0 for 'definitively no position', a positive count if held, or
-    None when the lookup itself failed (callers must treat that as
-    inconclusive, never as absence).
+    """Size of the position held on ONE market (contract count, always >= 0),
+    asked with the API's market filter. Returns 0.0 for 'definitively no
+    position', a positive count if held, or None when the lookup itself failed
+    (callers must treat that as inconclusive, never as absence).
+
+    The magnitude is deliberate: a SHORT position carries a NEGATIVE
+    netPosition (the bot sold to open — e.g. aughol 2026-07-13 held
+    netPosition -21). Callers only ask 'is a position held, and how big' via
+    `qty > 0`, so returning the signed value made every one of them read a
+    held short as absent — confirm_fills left short fills stuck pending, and
+    verify_cancelled_rows stamped a mis-cancelled short verified-cancelled
+    FOREVER (the aughol row, flagged by audit 2026-07-15). Summing magnitudes
+    also means a market that (impossibly) showed both legs can't net to a
+    false zero.
 
     This replaces 'list the whole portfolio and collect slugs': that listing
     is PAGINATED, and once the account held more positions than one page,
@@ -1103,7 +1105,7 @@ def _position_quantity(client, slug: str) -> float | None:
         if not isinstance(p, dict):
             continue
         try:
-            total += float(p.get("netPosition") or 0)
+            total += abs(float(p.get("netPosition") or 0))
         except (TypeError, ValueError):
             pass
     return total
@@ -1258,17 +1260,28 @@ def verify_cancelled_rows(auth):
     hand. The exchange is the source of truth, so verify against it:
 
       - position still held        -> restore to 'open' (normal settlement
-                                      flow takes it from there)
+                                      flow takes it from there). A SHORT
+                                      counts as held: _position_quantity now
+                                      returns magnitude, so a sold-to-open
+                                      position is no longer read as absent
+                                      (the aughol bug, audit 2026-07-15).
       - POSITION_RESOLUTION posted -> settle with the exchange's own
                                       fee-inclusive P&L
       - neither                    -> genuinely cancelled; flag verified so
                                       the row is never checked again
 
     Checks wait until the row is a few minutes old so the exchange's read
-    path has certainly indexed any fill, and each row is verified at most
-    once, so the steady-state API cost is zero. Known blind spot: a
-    MANUAL position on the same market would make a correctly-cancelled bot
-    row look filled — acceptable; the loud ops log makes any heal visible.
+    path has certainly indexed any fill. A row is settled/reopened at most
+    once; the 'genuinely cancelled' seal is deliberately DELAYED until the
+    row is old enough (SEAL_AFTER_MIN) that a filled-then-resolved position's
+    resolution activity would certainly have posted — otherwise a mis-cancel
+    that resolved in the seconds before its activity landed would be sealed
+    'no position, no resolution' and never re-examined (exactly how aughol
+    slipped past: a held short read as absent, then sealed before its
+    resolution posted). Until the seal, an unverified row is just re-checked
+    cheaply each cycle. Known blind spot: a MANUAL position on the same
+    market would make a correctly-cancelled bot row look filled — acceptable;
+    the loud ops log makes any heal visible.
     """
     if not config.LIVE:
         return
@@ -1278,6 +1291,7 @@ def verify_cancelled_rows(auth):
         fetch=True,
     )
     grace = 5  # minutes; read-path lag is seconds-scale, this is ample
+    seal_after = getattr(config, "CANCEL_SEAL_AFTER_MIN", 60)
     for pid, slug, price, quantity, created_at in rows:
         try:
             age_min = (datetime.now(timezone.utc)
@@ -1310,9 +1324,12 @@ def verify_cancelled_rows(auth):
             continue
         if res is RESOLUTION_CHECK_FAILED:
             continue  # couldn't check — retry next cycle, conclude NOTHING
-        # res is None: the feed answered — no position, no resolution.
-        # Only this definitive answer marks the cancel verified.
-        db("UPDATE positions SET cancel_verified=1 WHERE id=?", (pid,))
+        # res is None: the feed answered — no position, no resolution. Seal it
+        # as a genuine cancel ONLY once the row is old enough that a resolved
+        # position's activity would surely have posted; before that, keep
+        # re-checking so a resolution landing late still heals the row.
+        if age_min is None or age_min >= seal_after:
+            db("UPDATE positions SET cancel_verified=1 WHERE id=?", (pid,))
     return
 
 
@@ -1545,70 +1562,9 @@ def check_signal_settlements(client) -> int:
 
 _STUCK_SETTLEMENT_WARNED: dict = {}  # pid -> monotonic time of last "stuck" warning
 
-
-# Sentinel: the resolution check itself FAILED (feed down, rate-limited,
-# unrecognized shape). Distinct from None = the feed answered and there is
-# definitively no resolution. verify_cancelled_rows marked a mis-cancelled
-# row (ica-dnt, 2026-07-14) verified-forever off one transient failure
-# because the two cases were conflated — callers must retry on this value
-# and never conclude anything from it.
-RESOLUTION_CHECK_FAILED = object()
-
-
-def _resolution_pnl(auth, slug: str):
-    """(P&L, stable) from the account's POSITION_RESOLUTION activity for this
-    market; None when the feed answered and shows NO resolution (definitive);
-    RESOLUTION_CHECK_FAILED when the check itself failed — retry later.
-    Callers should branch with isinstance(res, tuple) for the settled case.
-
-    `stable` is False while the activity is younger than
-    RESOLUTION_STABLE_MINUTES: the exchange RESTATES the cost basis (rolls
-    fees in) shortly after posting the resolution — 16 positions audited on
-    2026-07-13 carried P&L read too early, overstating the book ~$10.6.
-    Callers may act on an unstable figure (it's close, and Discord shouldn't
-    wait) but must not mark it final (pnl_reconciled) until stable.
-
-    This feed is the same one the app's History tab shows, and it publishes
-    well BEFORE the public /markets/{slug}/settlement record — polling only
-    the latter made settlement messages lag by hours (reported 2026-07-13)."""
-    try:
-        resp = auth.portfolio.activities({
-            "marketSlug": slug,
-            "types": ["ACTIVITY_TYPE_POSITION_RESOLUTION"],
-            "limit": 1,
-        })
-    except Exception as e:
-        log.warning(f"Resolution-activity check failed for {slug}: {e}")
-        return RESOLUTION_CHECK_FAILED
-    if not isinstance(resp, dict) or "activities" not in resp:
-        return RESOLUTION_CHECK_FAILED  # unexpected shape is NOT an empty feed
-    if not resp["activities"]:
-        return None
-    activities = resp["activities"]
-    activity = next((a for a in activities
-                     if isinstance(a, dict) and isinstance(a.get("positionResolution"), dict)), None)
-    if activity is None:
-        return None  # the endpoint answered, but has no resolution for this market
-    pr = activity["positionResolution"]
-    before = pr.get("beforePosition") or {}
-    try:
-        cost = float((before.get("cost") or {}).get("value"))
-        cash_value = float((before.get("cashValue") or {}).get("value"))
-    except (TypeError, ValueError):
-        log.warning(f"Unrecognized resolution activity format for {slug}")
-        return RESOLUTION_CHECK_FAILED
-    stable = True  # unknown age -> assume stable (pre-updateTime API shapes)
-    raw_ts = pr.get("updateTime") or activity.get("updateTime")
-    if raw_ts:
-        try:
-            ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            age_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60
-            stable = age_min >= getattr(config, "RESOLUTION_STABLE_MINUTES", 45)
-        except (ValueError, TypeError):
-            pass
-    return round(cash_value - cost, 2), stable
+# _resolution_pnl and RESOLUTION_CHECK_FAILED are imported from manual_sync
+# (single source of truth for reading a POSITION_RESOLUTION activity) — the
+# bot loop and the manual-trade sync must read settlement the exact same way.
 
 
 def check_settlements(client, auth=None):
@@ -1694,31 +1650,6 @@ def check_settlements(client, auth=None):
     return settled_ids
 
 
-def check_manual_settlements(auth) -> int:
-    """Settle open manual trades from the exchange without touching positions."""
-    if auth is None:
-        return 0
-    rows = db("SELECT id, market_slug FROM manual_trades WHERE live=1 AND status='open'", fetch=True)
-    settled = 0
-    for trade_id, slug in rows:
-        res = _resolution_pnl(auth, slug)
-        if not isinstance(res, tuple):
-            continue
-        pnl, _stable = res
-        status = "won" if pnl > 0 else ("lost" if pnl < 0 else "push")
-        now = datetime.now(timezone.utc).isoformat()
-        db("""UPDATE manual_trades SET status=?, pnl=?, closed_at=?, updated_at=?,
-                                      close_reason='exchange resolution'
-              WHERE id=?""", (status, pnl, now, now, trade_id))
-        try:
-            reporting.post_discord_manual_trade(trade_id)
-        except Exception:
-            log.exception(f"Manual settlement Discord post failed for {slug}")
-        log.info(f"MANUAL TRADE SETTLED {status.upper()} {slug}  P&L {pnl:+.2f}")
-        settled += 1
-    return settled
-
-
 def reconcile_live_pnl(client):
     """Replace the estimated P&L on settled LIVE positions with the exchange's
     own realized figure (cost basis and proceeds, both fee-inclusive) from the
@@ -1728,12 +1659,34 @@ def reconcile_live_pnl(client):
     if not config.LIVE:
         return
     rows = db(
-        """SELECT id, market_slug FROM positions
+        """SELECT id, market_slug, settled_at, pnl FROM positions
            WHERE live=1 AND pnl_reconciled=0 AND status IN ('won','lost','push')""",
         fetch=True,
     )
-    for pid, slug in rows:
+    give_up_days = getattr(config, "RECONCILE_GIVE_UP_DAYS", 3)
+    for pid, slug, settled_at, est_pnl in rows:
         res = _resolution_pnl(client, slug)
+        if res is None and give_up_days and settled_at:
+            # The feed ANSWERED: no resolution activity exists (exchange
+            # quirk on some markets — it never posts one). Old enough means
+            # it never will; without a give-up this row polls the feed every
+            # cycle forever. Keep the estimate as final. A FAILED check
+            # (RESOLUTION_CHECK_FAILED) never lands here — that must retry.
+            try:
+                settled = datetime.fromisoformat(settled_at)
+                if settled.tzinfo is None:
+                    settled = settled.replace(tzinfo=timezone.utc)
+                age_days = (datetime.now(timezone.utc) - settled).total_seconds() / 86400
+            except (TypeError, ValueError):
+                age_days = None
+            if age_days is not None and age_days >= give_up_days:
+                db("UPDATE positions SET pnl_reconciled=1 WHERE id=?", (pid,))
+                est_label = f"{est_pnl:+.2f}" if est_pnl is not None else "unknown"
+                log.warning(
+                    f"Reconcile GIVE-UP {slug}: no resolution activity "
+                    f"{age_days:.0f}d after settlement (exchange never posted "
+                    f"one) — keeping estimated P&L {est_label} as final")
+            continue
         if not isinstance(res, tuple):
             continue  # not posted yet / check failed — retry next cycle
         real_pnl, stable = res
@@ -1856,6 +1809,15 @@ def cmd_run():
 
     while True:
         try:
+            # Cloudflare-ban circuit breaker: when the exchange has answered
+            # with a ban page (error 1015), calling through the ban resets
+            # its rolling window and extends it. Wait it out instead — every
+            # step below fails loudly and concludes nothing during a ban
+            # anyway (proven live, 2026-07-16).
+            cooldown = api_guard.cooldown_remaining()
+            if cooldown:
+                log.warning(f"Cloudflare ban cooldown — exchange calls paused {cooldown:.0f}s")
+                time.sleep(cooldown)
             scan_once(pub, auth, engines)
             confirm_fills(auth)
             capture_closing_lines(pub)
@@ -1864,7 +1826,12 @@ def cmd_run():
             verify_cancelled_rows(auth)
             mark_rescheduled_positions(pub)
             settled_ids = check_settlements(pub, auth if config.LIVE else None)
-            manual_settled = check_manual_settlements(auth if config.LIVE else None)
+            # Manual (hand-placed) activity on the same account: cash-outs of
+            # the bot's own positions, and standalone/updated manual bets. The
+            # cashed-out bot ids join the settlement Discord flow below.
+            manual_cashed_ids, manual_closed = manual_sync.manual_activity_pass(
+                auth if config.LIVE else None)
+            settled_ids = list(dict.fromkeys(settled_ids + manual_cashed_ids))
             check_signal_settlements(pub)
             if config.LIVE:
                 reconcile_live_pnl(auth)
@@ -1873,8 +1840,8 @@ def cmd_run():
                 reporting.post_discord_paper_summary(f"{len(settled_ids)} position(s) settled")
                 reporting.post_discord_summary(f"{len(settled_ids)} position(s) settled")
                 last_discord_status = time.monotonic()
-            elif manual_settled:
-                reporting.post_discord_summary(f"{manual_settled} manual trade(s) settled")
+            elif manual_closed:
+                reporting.post_discord_summary(f"{manual_closed} manual trade(s) settled")
                 last_discord_status = time.monotonic()
             interval = getattr(config, "DISCORD_STATUS_INTERVAL_MIN", 30) * 60
             if interval > 0 and time.monotonic() - last_discord_status >= interval:
@@ -1894,6 +1861,7 @@ def cmd_run():
             log.info("Shutting down (Ctrl+C)")
             break
         except Exception as e:
+            api_guard.note_error(e)
             log.error(f"Cycle error: {e}", exc_info=True)
         time.sleep(getattr(config, "SCAN_INTERVAL_SECONDS", 60))
 

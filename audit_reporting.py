@@ -85,6 +85,7 @@ if not rows:
 
 # ------------------------------------------------------- B. exchange truth
 section("B. Exchange resolutions vs DB (last 50)")
+c = None
 try:
     from polymarket_us import PolymarketUS
     c = PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY)
@@ -101,8 +102,22 @@ except Exception as e:
 cutoff = q("SELECT MIN(created_at) FROM positions WHERE live=1")
 cutoff = (cutoff[0][0] if cutoff and cutoff[0][0] else "9999")
 
+# Markets the operator traded by hand live in manual_trades, NOT positions —
+# a resolution there is tracked, just in the other ledger. Without this the
+# audit false-flags every resolving manual bet as "untracked" (fra-esp,
+# 2026-07-15). Any live manual row for the slug counts as tracked; if it's
+# still open the sync just hasn't closed it yet (informational, not a flag).
+manual_rows = {}
+try:
+    for slug_m, status_m in q(
+            "SELECT market_slug, status FROM manual_trades WHERE live=1") or []:
+        manual_rows.setdefault(slug_m, set()).add(status_m)
+except Exception:
+    pass  # older DB without manual_trades — nothing manual to reconcile
+
 mismatched = []
 skipped_precutoff = 0
+skipped_manual = 0
 for a in activities:
     pr = a.get("positionResolution") or {}
     slug = pr.get("marketSlug") or "?"
@@ -113,6 +128,15 @@ for a in activities:
         ex_pnl = None
     row = q("SELECT status, pnl FROM positions WHERE market_slug=?", slug)
     if not row:
+        if slug in manual_rows:
+            # Tracked as a manual trade. Only note it if it's still open —
+            # that means the manual sync hasn't settled it yet, worth an eye.
+            if manual_rows[slug] & {"open", "pending"}:
+                print(f"  (manual trade {slug} resolved on exchange but its row is "
+                      f"still open — the next manual sync should close it)")
+            else:
+                skipped_manual += 1
+            continue
         upd = str(pr.get("updateTime") or a.get("updateTime") or "").replace("Z", "+00:00")
         if upd and upd < cutoff:
             skipped_precutoff += 1
@@ -127,6 +151,8 @@ for a in activities:
         mismatched.append(slug)
 if skipped_precutoff:
     print(f"  ({skipped_precutoff} pre-cutover resolutions skipped — other bot's history)")
+if skipped_manual:
+    print(f"  ({skipped_manual} resolutions skipped — tracked in manual_trades, already closed)")
 if activities and not FLAGS:
     print("  all resolutions matched — good")
 
@@ -151,6 +177,47 @@ if mismatched:
             except Exception:
                 p = "?"
             print(f"    #{i}: pnl={p} update={pr.get('updateTime','?')[:19]} side={pr.get('side','?')}")
+
+# ------------------------ D. Manual closed rows vs exchange realized P&L
+# The 2026-07-15 sign bug booked underdog LOSSES as gains and still passed
+# this audit, because B only reconciles SETTLED *positions* rows against the
+# exchange — it never checked manual cashed_out rows. Close that: compare each
+# exchange-derived manual row's stored P&L to the exchange's OWN realized
+# figure (Σ effectiveRealizedPnl on closing fills, plus any resolution on a
+# held remainder). A flipped sign shows up as a ~2x drift here.
+section("D. Manual trades vs exchange realized P&L")
+if c is None:
+    print("  exchange unavailable — skipped")
+else:
+    try:
+        import manual_sync
+    except Exception as e:
+        manual_sync = None
+        print(f"  manual_sync import failed ({e}) — skipped")
+    if manual_sync is not None:
+        closed = q("""SELECT market_slug, status, pnl FROM manual_trades
+                      WHERE live=1 AND status IN ('cashed_out','won','lost','push')""")
+        checked = 0
+        for slug, status, db_pnl in closed:
+            fills = manual_sync.manual_fills(c, slug)
+            if not fills:
+                continue  # hand-entered row with no exchange trace — can't reconcile
+            _net, _oc, realized = manual_sync.summarize(fills)
+            res = manual_sync.resolution_pnl(c, slug)
+            if res is manual_sync.RESOLUTION_CHECK_FAILED:
+                continue  # transient — don't flag on an unverifiable check
+            expected = round(realized + res[0], 2) if isinstance(res, tuple) else realized
+            if db_pnl is None:
+                flag(f"manual {slug}: {status} but pnl NULL (exchange realized {expected:+.2f})")
+            elif abs(db_pnl - expected) > 0.02:
+                flag(f"manual {slug}: DB pnl {db_pnl:+.2f} vs exchange realized "
+                     f"{expected:+.2f} (drift {db_pnl - expected:+.2f}) — direction/sign bug?")
+            else:
+                checked += 1
+        if checked:
+            print(f"  {checked} manual row(s) match the exchange's realized P&L — good")
+        else:
+            print("  no exchange-derived manual rows to reconcile")
 
 print(f"\n{'='*50}\n{FLAGS} issue(s) flagged" if FLAGS else f"\n{'='*50}\nCLEAN — reporting inputs are consistent")
 sys.exit(1 if FLAGS else 0)
