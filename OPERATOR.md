@@ -388,10 +388,10 @@ against exactly this. Do not weaken them to get more volume.
 | ATP | TML-Database | **0.2180** | real surface labels; surface blend earns its keep |
 | WTA | ESPN | **0.2278** | no TML-style mirror exists for WTA |
 | MLB | ESPN | **0.2437** | source swapped from statsapi.mlb.com 2026-07-18 (it blocks the droplet's IP — see §11); ESPN carries results **and** probable starters, ids are ESPN athlete ids end to end. Brier identical on the new source. |
-| LoL | Leaguepedia + Oracle's Elixir | **0.2102** (XGB blend) | **the one active XGBoost model** — see below |
+| LoL | Leaguepedia + Oracle's Elixir | **0.2102** (XGB blend) | on the XGBoost player blend — see below |
 | Dota 2 | PandaScore | **0.2146** | 34.8k matches; + dormancy regression |
 | CS2 | PandaScore | **0.2250** | 51.9k matches; + dormancy regression |
-| Valorant | PandaScore | **0.231** | |
+| Valorant | PandaScore | **0.231** | Elo is baseline + fallback; gated XGB player blend (Kaggle VCT) live 2026-07-18 — test Brier 0.2404 vs 0.2464 **map-level**, not comparable to the 0.231 series-level figure |
 | ITF | *none* | — | no free data source exists; markets are skipped, never guessed |
 
 Lower Brier is better; **0.25 = a coin flip.**
@@ -404,13 +404,17 @@ out-of-sample (`beats_elo` in its meta) and (b) was trained within
 falls back to Elo. Missing model, stale model, failed load, missing dependency
 — all fail safe to Elo.
 
-**LoL is the only sport currently on XGBoost** (activated 2026-07-14). It's a
-team-Elo + player-aggregate blend built from the Oracle's Elixir sidecar, test
-Brier 0.2102 vs 0.2183 for Elo. Its entire feature row comes from the OE
-sidecar — **never** the live Leaguepedia match engine, which is a different
-rating space; mixing them is train/serve drift. Confirm it's actually live with:
+**Two sports currently run XGBoost: LoL** (activated 2026-07-14) **and
+Valorant** (activated 2026-07-18 — details in the player-data table below).
+LoL is a team-Elo + player-aggregate blend built from the Oracle's Elixir
+sidecar, test Brier 0.2102 vs 0.2183 for Elo. Its entire feature row comes
+from the OE sidecar — **never** the live Leaguepedia match engine, which is a
+different rating space; mixing them is train/serve drift. Valorant follows the
+same contract on its own sidecar (`valorant_player_model.json`, VLR ids from
+the Kaggle VCT archive). Confirm they're actually live with:
 ```bash
-grep -i "XGB lol" divergence_bot.log | tail -1   # want: "XGB lol ACTIVE"
+grep -i "XGB lol" divergence_bot.log | tail -1        # want: "XGB lol ACTIVE"
+grep -i "XGB valorant" divergence_bot.log | tail -1   # want: "XGB valorant ACTIVE"
 ```
 
 > **The trap that already bit us:** a model can clear every gate and still be
@@ -518,9 +522,13 @@ pattern: **new data wins, new algorithms don't.**
 - **The live 30% price floor** is under review. The paper ledger records the
   full 5–95% range specifically so its price-band table can answer whether the
   floor is costing us money. That table is the evidence; wait for it.
-- **LoL XGB blend** just went live (2026-07-14). Watch its CLV and win rate:
-  a +0.008 Brier improvement in backtest is a *hypothesis* about real money,
-  not a fact about it.
+- **LoL XGB blend** went live 2026-07-14 and the **Valorant XGB blend**
+  2026-07-18. Watch their CLV and win rates: a backtest Brier improvement
+  (+0.008 LoL, +0.006 Valorant) is a *hypothesis* about real money, not a
+  fact about it. Two staleness clocks on each: the sidecar freshness gate
+  (45 days from the data source's last update) and `XGB_STALE_DAYS = 45`
+  from `trained_at` — LoL's model gate closes ~2026-08-28 and Valorant's
+  ~2026-09-01 unless retrained; either lapse silently falls back to Elo.
 
 ---
 
