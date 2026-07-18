@@ -1,5 +1,9 @@
-"""MLB Elo adapter, backed by the free MLB Stats API (statsapi.mlb.com,
-no key required) via elo/history.py's cached fetcher.
+"""MLB Elo adapter, backed by ESPN's free scoreboard API (keyless) via
+elo/history.py's cached fetcher — switched from statsapi.mlb.com on
+2026-07-18 after MLB started blocking the droplet's IP (origin-level 406,
+~2026-07-10). ESPN carries finals AND per-game probable starters on both
+historical and upcoming games; pitcher ids are ESPN athlete ids end to end
+(never mix them with statsapi ids — different id space).
 
 Two upgrades over plain team Elo, both motivated by the first backtest of
 this project (team-only Elo scored Brier 0.248 — barely better than a
@@ -9,8 +13,8 @@ this project (team-only Elo scored Brier 0.248 — barely better than a
    in baseball far more than team strength does. Each starter carries his
    own rating (updated per start from how the game went vs expectation);
    a game's effective team gap is shifted by pitcher_weight × the starters'
-   rating gap. Probable pitchers come from the same schedule API
-   (hydrate=probablePitcher — verified live it's populated on historical
+   rating gap. Probable pitchers come from the same ESPN scoreboard
+   (`probables` per competitor — verified live it's populated on historical
    games too, and available pregame for upcoming games).
 
 2. MARGIN-OF-VICTORY K scaling (elo.engine.mov_multiplier) — a 10-run
@@ -41,53 +45,82 @@ PITCHER_DEFAULT = 1500.0
 
 _PP_CACHE: tuple[float, dict] | None = None
 _PP_CACHE_TTL = 30 * 60
+_PP_RETRY_AFTER_FAILURE = 2 * 60
 
 
 def probable_pitchers() -> dict[tuple[str, str], int]:
     """{(officialDate, team_name): pitcher_id} for today through +2 days.
-    Empty dict on failure — predictions then fall back to team-only."""
+
+    A FAILED fetch never poisons the cache: the last good answer keeps
+    serving (a 30-min-stale starter beats none — the market has priced the
+    real one, and predicting team-only against it is the adverse-selection
+    trap) and the next attempt comes after _PP_RETRY_AFTER_FAILURE instead
+    of a full TTL. Only a fetch that ANSWERED — even with no starters
+    announced yet, a real pregame state — is cached as truth for the TTL.
+    statsapi.mlb.com serves intermittent 406s (seen 2026-07-16/18), so the
+    failure path is routine, not hypothetical. Serving stale across a long
+    outage is self-limiting: entries are keyed by officialDate, so an old
+    snapshot simply has no keys for later dates and predictions fall back
+    to team-only, same as before."""
     global _PP_CACHE
     now = time.monotonic()
     if _PP_CACHE and now - _PP_CACHE[0] < _PP_CACHE_TTL:
         return _PP_CACHE[1]
     start = date.today()
-    url = history.MLB_SCHEDULE.format(start=start.isoformat(),
-                                      end=(start + timedelta(days=2)).isoformat())
+    url = history.ESPN_SCOREBOARD.format(
+        path=history.ESPN_MLB_PATH,
+        d1=start.strftime("%Y%m%d"),
+        d2=(start + timedelta(days=2)).strftime("%Y%m%d"), limit=100)
     data = history._get_json(url)
-    out: dict[tuple[str, str], int] = {}
-    for d in (data or {}).get("dates", []):
-        for g in d.get("games", []):
-            for side in ("home", "away"):
-                t = (g.get("teams") or {}).get(side) or {}
-                name = (t.get("team") or {}).get("name")
-                pid = (t.get("probablePitcher") or {}).get("id")
-                if name and pid:
-                    name = history.MLB_NAME_ALIASES.get(name, name)
-                    out[(d.get("date"), name)] = pid
+    if data is None:
+        stale = _PP_CACHE[1] if _PP_CACHE else {}
+        # Backdate the timestamp so the existing freshness check retries
+        # after _PP_RETRY_AFTER_FAILURE seconds, serving stale meanwhile.
+        _PP_CACHE = (now - _PP_CACHE_TTL + _PP_RETRY_AFTER_FAILURE, stale)
+        if stale:
+            log.warning("probable-pitcher fetch failed — serving previous "
+                        f"snapshot ({len(stale)} entries), retrying in "
+                        f"{_PP_RETRY_AFTER_FAILURE // 60} min")
+        return stale
+    out: dict[tuple[str, str], str] = {}
+    for ev in data.get("events", []):
+        if (ev.get("season") or {}).get("type") not in history.ESPN_MLB_SEASON_TYPES:
+            continue  # spring training; All-Star has no probables anyway
+        comps = ev.get("competitions") or []
+        if not comps:
+            continue
+        c = comps[0]
+        game_date = (c.get("date") or ev.get("date") or "")[:10]
+        for comp in c.get("competitors") or []:
+            name = (comp.get("team") or {}).get("displayName")
+            probables = comp.get("probables") or []
+            pid = ((probables[0].get("athlete") or {}).get("id")) if probables else None
+            if name and pid and game_date:
+                name = history.MLB_NAME_ALIASES.get(name, name)
+                out[(game_date, name)] = str(pid)
     _PP_CACHE = (now, out)
     return out
 
 
-def pitcher_for(team: str, game_date: date) -> int | None:
-    """Probable starter for a team on/around a date. MLB's officialDate is
-    US-local while market start times are UTC (a 10pm ET start is already
-    'tomorrow' in UTC), so the previous day is checked too."""
-    pp = probable_pitchers()
-    for d in (game_date, game_date - timedelta(days=1)):
-        pid = pp.get((d.isoformat(), team))
-        if pid:
-            return pid
-    return None
+def pitcher_for(team: str, game_date: date) -> str | None:
+    """Probable starter for a team on a UTC date. Both sides of the lookup
+    derive from the game's actual start instant in UTC (the market's
+    gameStartTime and ESPN's competition date), so exact match is correct.
+    No ±1-day fallback: with UTC-to-UTC keys a neighbouring day can only
+    ever name a pitcher who is NOT starting this game (that was a statsapi
+    artifact, when its officialDate was US-local)."""
+    return probable_pitchers().get((game_date.isoformat(), team))
 
 
 def fetch_games(start_year: int, end_year: int | None = None) -> list[dict]:
     end_year = end_year or date.today().year
-    games = []
-    for year in range(start_year, end_year + 1):
-        season = history.mlb_season(year)
-        if season:
-            log.info(f"MLB {year}: {len(season)} finished games")
-        games.extend(season)
+    games = history.espn_mlb_games(date(start_year, 3, 1),
+                                   min(date(end_year, 11, 15), date.today()))
+    by_year: dict[str, int] = {}
+    for g in games:
+        by_year[g["date"][:4]] = by_year.get(g["date"][:4], 0) + 1
+    for year, n in sorted(by_year.items()):
+        log.info(f"MLB {year}: {n} finished games")
     return games
 
 
@@ -131,7 +164,11 @@ def replay(games: list[dict], p: dict, collect: bool = False,
         """Stat-implied pitcher ratings from the PRIOR season's ERA — prior
         season only, so this is walk-forward honest (a rookie's eventual
         full-season ERA is never used to predict his own debut). Weighted by
-        innings reliability: below ~30 IP an ERA is mostly noise."""
+        innings reliability: below ~30 IP an ERA is mostly noise.
+
+        NOTE: inactive (pitcher_seed_scale=0, a settled dead end) and backed
+        by statsapi.mlb.com, which blocks the droplet — and its ids are NOT
+        ESPN ids. If ever revived, it needs an ESPN-id stats source first."""
         scale = p.get("pitcher_seed_scale", 0.0)
         if not scale:
             return {}

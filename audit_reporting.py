@@ -87,8 +87,9 @@ if not rows:
 section("B. Exchange resolutions vs DB (last 50)")
 c = None
 try:
+    import api_guard
     from polymarket_us import PolymarketUS
-    c = PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY)
+    c = api_guard.governed(PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY))
     resp = c.portfolio.activities({"types": ["ACTIVITY_TYPE_POSITION_RESOLUTION"], "limit": 50})
     activities = resp.get("activities") or []
 except Exception as e:

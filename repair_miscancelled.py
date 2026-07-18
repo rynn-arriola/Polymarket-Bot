@@ -27,8 +27,9 @@ import config
 
 APPLY = "--apply" in sys.argv
 
+import api_guard
 from polymarket_us import PolymarketUS
-client = PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY)
+client = api_guard.governed(PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY))
 
 con = sqlite3.connect("positions.db" if APPLY
                       else "file:positions.db?mode=ro", uri=not APPLY)

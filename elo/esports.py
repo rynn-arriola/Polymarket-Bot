@@ -113,6 +113,10 @@ DOTA_MAX_CALLS = 450  # ~100 matches/call; free tier is 2000/day. On a deepening
 def _fetch_dota2(store: dict, teams: dict | None = None) -> int:
     added, calls = 0, 0
     cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=DOTA_BACKFILL_DAYS)).timestamp()
+    cutoff_date = datetime.fromtimestamp(cutoff_ts, timezone.utc).date().isoformat()
+    oldest_stored = min((str(row[0])[:10] for row in store.values()
+                         if isinstance(row, list) and row), default="")
+    backfill_complete = bool(oldest_stored and oldest_stored <= cutoff_date)
     less_than = None
     consecutive_known = 0
     while calls < DOTA_MAX_CALLS:
@@ -154,13 +158,16 @@ def _fetch_dota2(store: dict, teams: dict | None = None) -> int:
         if oldest_ts < cutoff_ts:
             break
         # Incremental early stop — only on pages that actually HAD named
-        # matches, all already stored, twice in a row. The first version
+        # matches, all already stored, twice in a row. Once the configured
+        # cutoff is stored, added=0 is a normal incremental no-op; walking all
+        # 450 pages would consume the lineup collector's daily API budget. The
+        # first version
         # stopped on any page with nothing new, which included pages that
         # were 100% nameless rows — that silently truncated the backfill to
         # ~3 months (caught 2026-07-08: store had no Team Spirit/BetBoom).
         if named_on_page > 0 and new_on_page == 0:
             consecutive_known += 1
-            if consecutive_known >= 2 and added > 0:
+            if consecutive_known >= 2 and (added > 0 or backfill_complete):
                 break
         else:
             consecutive_known = 0
@@ -667,8 +674,9 @@ def recent_match_dates(title: str, team_name: str) -> list[str]:
     return out
 
 
-DOTA_LINEUP_CALLS_PER_RUN = 300  # OpenDota free tier is 2000/day; the id walk
-                                  # plus 4 refresh runs/day of lineups stays under it
+DOTA_LINEUP_CALLS_PER_RUN = 450  # 1,800/day across four refreshes; the completed
+                                  # id walk now stops at the known head, leaving
+                                  # retry headroom under the 2,000/day free tier
 
 
 def deepen_dota_player_data():
@@ -713,7 +721,15 @@ def capture_dota_lineups(store: dict):
             lineups = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         lineups = {}
-    todo = sorted((mid for mid in store if mid not in lineups and str(mid).isdigit()),
+    historical_ids = set()
+    try:
+        from elo.esports_players import dota_historical_ids
+        historical_ids = dota_historical_ids()
+    except Exception as e:
+        log.warning(f"dota2 historical-id index unavailable ({e}) — collector will dedupe locally")
+    todo = sorted((mid for mid in store
+                   if mid not in lineups and str(mid).isdigit()
+                   and str(mid) not in historical_ids),
                   key=lambda mid: store[mid][0], reverse=True)[:DOTA_LINEUP_CALLS_PER_RUN]
     fetched = 0
     for mid in todo:
@@ -734,8 +750,12 @@ def capture_dota_lineups(store: dict):
         STORE_DIR.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(lineups, f)
+    bulk_count = sum(1 for mid in store if str(mid) in historical_ids)
+    remaining = sum(1 for mid in store
+                    if str(mid).isdigit() and mid not in lineups
+                    and str(mid) not in historical_ids)
     log.info(f"dota2 lineup capture: +{fetched} this run, {len(lineups)} total "
-             f"({len(store) - len(lineups)} still uncaptured)")
+             f"({remaining} still uncaptured; {bulk_count} supplied by bulk history)")
 
 
 def _lineup_games(filename: str) -> list[dict]:
@@ -760,6 +780,13 @@ def load_dota_games() -> list[dict]:
 
 def load_cs2_games() -> list[dict]:
     return _lineup_games("esports_cs2_lineups.json")
+
+
+def _canonical_cs2_lineup(game: dict) -> bool:
+    sides = list(game.get("teams", {}).values())
+    return (len(sides) == 2 and all(len(players) >= 3 for players in sides)
+            and all(str(player).startswith("cs2:")
+                    for players in sides for player in players))
 
 
 # CS2 lineups: bo3.gg's match LIST endpoint carries all 10 players per row
@@ -816,12 +843,16 @@ def deepen_cs2_player_data():
             if not (mid and start and n1 and n2 and id1 and id2 and wid in (id1, id2)):
                 continue
             eligible_on_page += 1
-            if mid in lineups:
+            existing = lineups.get(mid)
+            if existing and _canonical_cs2_lineup(existing):
                 continue
             sides: dict = {id1: [], id2: []}
+            from elo.esports_players import cs2_player_key
             for p in m.get("players") or []:
                 if p.get("id") and p.get("team_id") in sides:
-                    sides[p["team_id"]].append(str(p["id"]))
+                    player = cs2_player_key(p.get("nickname") or p.get("slug"))
+                    if player:
+                        sides[p["team_id"]].append(player)
             if min(len(sides[id1]), len(sides[id2])) < 3:
                 continue  # thin row — retry next run while inside the window
             winner = n1 if wid == id1 else n2
@@ -839,11 +870,15 @@ def deepen_cs2_player_data():
             consecutive_known = 0
         offset += 100
         time.sleep(0.3)
-    if added:
+    legacy = [mid for mid, game in lineups.items() if not _canonical_cs2_lineup(game)]
+    for mid in legacy:
+        del lineups[mid]
+    if added or legacy:
         STORE_DIR.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(lineups, f)
-    log.info(f"cs2 lineup capture: +{added} this run, {len(lineups)} total")
+    log.info(f"cs2 lineup capture: +{added} this run, {len(lineups)} total "
+             f"({len(legacy)} unresolved legacy rows removed)")
 
 
 def _apply_inactivity_decay(engine: EloEngine, team: str, game_day, last_played: dict, p: dict):

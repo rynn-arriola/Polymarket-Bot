@@ -285,15 +285,30 @@ Then, off the back of those:
 ## 6. What's automatic (never action these)
 
 - Market scan, entries, fill confirmation, cancels: every **60 s**.
-- The market **catalog** (the ~9,000-market list) refetches every
-  **10 min** (`MARKET_LIST_REFRESH_MIN`), paced, and is reused in between —
-  it's discovery metadata only; **entry prices always come from a fresh
-  per-market bbo call every cycle.** This is the rate-limit fix; see
+- **Rate-limit governor:** every exchange HTTP call passes through a global
+  token bucket (`api_guard.pace()`, `API_SUSTAINED_CALLS_PER_SEC = 1.5` +
+  `API_BURST_CALLS = 10` ≈ 100 calls/min worst case) — the bot structurally
+  cannot exceed the call budget; busy windows queue calls for a moment
+  instead of bursting. The standalone diagnostics (`audit_reporting`,
+  `repair_miscancelled`, `manual_trades sync`, `fix_manual_signs`) are
+  governed the same way. An occasional "API pacing engaged" log line is the
+  governor working, not a fault.
+- The market **catalog** refetches every **10 min**
+  (`MARKET_LIST_REFRESH_MIN`) as a paced ~20-call drip (500 markets/page —
+  the server's cap — filtered server-side to `MARKET_CATEGORIES =
+  ("sports",)`), and is reused in between — it's discovery metadata only;
+  **entry prices always come from a fresh per-market bbo call every cycle.**
+  This is the rate-limit fix; see
   [History](#11-history-incidents-and-what-they-taught).
 - Cloudflare-ban circuit breaker: if the exchange answers with a ban page
   (error 1015), all exchange calls pause `API_BAN_COOLDOWN_MIN = 5` min so
-  the ban can expire, instead of hammering through and extending it. Expect
-  the log line "Cloudflare ban cooldown"; positions are safe while paused.
+  the ban can expire, instead of hammering through and extending it. Repeat
+  bans within `API_BAN_RECENT_MIN = 15` min escalate the pause (5 → 10 → 20 →
+  `API_BAN_COOLDOWN_MAX_MIN = 40` min cap), and for
+  `POST_BAN_CATALOG_GRACE_MIN = 10` min after any ban the catalog refetch (the
+  heaviest burst) is deferred in favor of the cached copy. Expect the log
+  lines "Cloudflare ban cooldown" / "Catalog refetch deferred"; positions are
+  safe while paused.
 - Reconcile give-up: a settled row whose resolution activity still hasn't
   appeared `RECONCILE_GIVE_UP_DAYS = 3` days after settlement keeps its
   estimated P&L as final (the exchange never posts one for some markets —
@@ -313,8 +328,8 @@ Then, off the back of those:
   without a restart. Trading never pauses; a hung rebuild can't take the bot
   down (last-good ratings stay live).
 - Player-data collection (Dota 2 + CS2): each refresh also captures per-match
-  lineups — Dota from OpenDota (up to 300/run into
-  `data/cache/esports_dota2_lineups.json`; ~5–10 min inside the background
+  lineups — Dota from OpenDota (up to 450/run into
+  `data/cache/esports_dota2_lineups.json`; ~8–12 min inside the background
   refresh, under OpenDota's 2,000-calls/day free tier) and CS2 from bo3.gg
   (`esports_cs2_lineups.json`; forward-only, last-30-days window, a handful
   of calls). Groundwork for future player models (see the XGBoost status in
@@ -371,7 +386,7 @@ against exactly this. Do not weaken them to get more volume.
 | FWC (World Cup) | ESPN | **0.2026** | draw-decomposed; thin sample, treat with skepticism |
 | ATP | TML-Database | **0.2180** | real surface labels; surface blend earns its keep |
 | WTA | ESPN | **0.2278** | no TML-style mirror exists for WTA |
-| MLB | MLB Stats API | **0.2437** | weakest; ceiling looks structural (see dead ends) |
+| MLB | ESPN | **0.2437** | source swapped from statsapi.mlb.com 2026-07-18 (it blocks the droplet's IP — see §11); ESPN carries results **and** probable starters, ids are ESPN athlete ids end to end. Brier identical on the new source. |
 | LoL | Leaguepedia + Oracle's Elixir | **0.2102** (XGB blend) | **the one active XGBoost model** — see below |
 | Dota 2 | PandaScore | **0.2146** | 34.8k matches; + dormancy regression |
 | CS2 | PandaScore | **0.2250** | 51.9k matches; + dormancy regression |
@@ -419,9 +434,9 @@ pattern applied to the sports where roster churn hurts most:
 | Title | Player data | Status |
 |---|---|---|
 | LoL | Oracle's Elixir CSVs | **have it** — powers the live blend |
-| Dota 2 | OpenDota per-match lineups | **collector live in the 6h refresh** — ~18-month backfill completes in ~3–4 weeks; a player model becomes trainable (on xgboost-dev, activated only via the usual XGB gates) once the store is deep |
-| CS2 | bo3.gg per-match players | **forward-only collector live in the 6h refresh (since 2026-07-16)** — players carry only their *current* team, so history can't be side-split: the store grows only from deploy day (~1.5k tier s–c matches/month) |
-| Valorant | none | probed 2026-07-16: no free per-match source; PandaScore's paid stats plans are restricted to non-betting usage |
+| Dota 2 | OpenDota collector + published pro-match Parquet | **research bootstrap built 2026-07-18 on `codex/dota-cs2-player-bootstrap`, not live.** `darianogina/dota-2-matches-pro-leagues` contains 193,773 raw maps / 191,202 usable merged games with stable player ids. Real archive audit found it ends **2024-10-15**, leaving a 638-day gap to the current OpenDota collector. Server audit before acceleration: 1,006/39,917 lineups captured (2.5%, 38,911 pending). The 2026-07-18 00:08 UTC refresh proved the old `added=0` path could walk into HTTP 429 before lineup capture. The completed id walk now stops after two known pages and the lineup batch rises 300→450 per 6h run, reducing the estimate from ~32 to ~22 days while remaining under 2,000 calls/day. Chronological same-source test: player Elo 0.2356 vs team Elo 0.2458 over 23,898 maps, but that universe is not comparable to production PandaScore's 0.2146 series-level Brier. Bulk/OpenDota overlap is keyed by the shared match id: bulk wins the merge, and the collector skips per-match API calls for ids already in the Parquet. Useful cold start; **does not clear the live gate**. |
+| CS2 | bo3.gg forward collector + parsed-demo metadata | **research bootstrap built 2026-07-18 on `codex/dota-cs2-player-bootstrap`, not live.** The initially considered Kaggle HLTV dataset was **rejected**: a May 2024 Spirit row contains later roster members, proving its player columns leak current rosters backward. Replacement `blanchon/cs2_dataset_demo` is replay-grounded and yields 1,000 exact maps (2026-03-23–04-20). The bo3 nickname migration was driven against the real endpoint locally: 472 stored rows / 4,297 player entries, all canonical nickname keys and zero legacy ids. Combined audit: 1,472 maps, a 59-day source gap, and **83 eligible test predictions** — still below the 100-game minimum, so there is no model verdict and no live activation. Its metadata is CC-BY, but the publisher says original tournament terms may still apply; provenance/usage review is another required pre-live gate. |
+| Valorant | Kaggle VCT dataset (found 2026-07-18) | **viable, not yet built.** `ryanluong1/valorant-champion-tour-2021-2023-data` (title says 2021–2026): per-map 5-player lineups + rich stats, MIT, ~monthly updates (last 2026-06-26), anonymously downloadable — the Oracle's-Elixir pattern, zero scraping by us. Verified 2026-07-18 on the real archive. Caveats for the eventual build: **no dates** (order by Match ID — vlr assigns them ~chronologically), ~7% of scores rows have team-name/Match-Name mismatches (**join on Team IDs**, as the author warns), China-hosted matches missing stats, and updates lag up to ~a month (needs an OE-style staleness gate). Build waits until the Dota/CS2 collectors prove the player-model pattern. The 07-16 "no free per-match source" conclusion was true for APIs but missed published datasets. |
 
 ### Name matching — the highest-maintenance part of the system
 
@@ -548,6 +563,49 @@ both cost real money, and both look like over-engineering until you know why.
   paced pagination (prices were never in the catalog — they come from
   per-market bbo calls, still every cycle), and a ban-page answer now pauses
   all exchange calls for 5 min (`api_guard.py`) instead of hammering through.
+- **The Cloudflare ban loop (2026-07-17).** Eleven ban episodes in 2 h
+  (09:35–11:35), no money lost (the circuit breaker paused each time). Two
+  causes, both aftermath of the 07-16 fix being sized for a smaller world:
+  (1) the catalog had grown to ~11,500 markets (~115 pages) and the 0.25 s
+  page spacing still meant a ~4 req/s stream for 30 s — fine in quiet hours,
+  over the limit whenever a busy match window stacked settlement/CLV calls on
+  top (nearly every ban landed seconds after a catalog fetch completed); and
+  (2) the flat 5-min cooldown looped: the catalog cache expired *during* the
+  pause, so the first post-resume cycle refired the full burst at a still-warm
+  rate limiter and was re-banned in seconds — and some resumes hit a
+  still-active ban outright. Fixes, in order of importance: (a) **the global
+  token-bucket governor** — every exchange call now passes `api_guard.pace()`
+  (`API_SUSTAINED_CALLS_PER_SEC`/`API_BURST_CALLS`), so the aggregate rate is
+  capped by construction; (b) the catalog shrunk ~6x (500/page server cap +
+  server-side `categories=["sports"]` filter, probed live 2026-07-17) and its
+  page spacing went 0.25 s → 1.0 s; (c) escalating cooldown on repeat bans
+  (5 → 10 → 20 → 40 min cap, `API_BAN_COOLDOWN_MAX_MIN`), measured from the
+  previous cooldown's END; (d) a 10-min post-ban grace during which the
+  cached catalog is served instead of refetched
+  (`POST_BAN_CATALOG_GRACE_MIN`).
+- **The invisible MLB freeze (2026-07-18).** statsapi.mlb.com started
+  blocking the droplet's IP (~2026-07-10; origin-level 406, all header
+  variants, residential IPs unaffected). Two cache bugs turned a blocked
+  source into silent model damage: a failed probable-pitcher fetch cached an
+  EMPTY pitcher map for its full 30-min TTL, and — far worse — a failed
+  `cached_chunk` refetch returned `[]` while ignoring the good cache on
+  disk, so the season-sized `mlb_2026` chunk vanished from every 6h rebuild
+  and live MLB Elo regressed to end-of-2025 ratings for a week. The
+  freshness guard saw nothing: it keys on `last_built`, which kept updating
+  (known gap: it ignores `latest_game_date`). 12 real bets rode the frozen
+  ratings (7 settled +$14.16 — luck; 5 open). Fixes: both caches now serve
+  their last good answer on a failed fetch and retry soon (pitcher: 2 min;
+  chunk: next build), and **MLB trading is paused** until the source works
+  from the server again (see the models table). The recurring lesson, third
+  instance of the same class after the 07-14 `None`-that-meant-two-things:
+  **a fetch that FAILED must never be recorded as an answer.**
+  *Resolution, same day:* MLB was switched to **ESPN** (results + probables,
+  reachable from the droplet, walk-forward Brier identical at 0.2437) and
+  re-enabled. Two traps found en route, recorded here because they'll recur:
+  ESPN team names are **era-accurate** ("Oakland Athletics" pre-2025), so
+  aliases must apply *before* any current-name whitelist or a renamed team's
+  entire history silently vanishes; and ESPN dates are UTC — statsapi's were
+  US-local — so date-keyed joins must not carry over local-date workarounds.
 
 ---
 
@@ -636,12 +694,13 @@ handle it. Paste the output.
 | `pull_server_state.py` | **daily.** Pulls live DB + server ratings DOWN into `server_mirror/`. One-way; the only backup of the live money record. |
 | `repair_miscancelled.py` | standing repair tool for wrongly-cancelled rows |
 | `name_match.py` | Polymarket name → Elo name resolution (exact → alias → fuzzy) |
-| `api_guard.py` | Cloudflare-ban detection + cooldown (the rate-limit circuit breaker) |
+| `api_guard.py` | the rate-limit layer: token-bucket governor on every exchange call (`pace()`/`governed()`) + Cloudflare-ban detection with escalating cooldown |
 | `elo/` | the rating engines — `engine`, `basketball`, `tennis`, `mlb`, `soccer`, `esports`, `lol_players`, `rosters`, `injuries`, `history`, `params` |
 | `xgb_live.py` | the **gated** XGBoost override + shared feature builders |
 | `train_xgb.py`, `xgb_features.py` | XGBoost training + walk-forward extractors |
 | `build_ratings.py`, `refresh_data.py`, `refresh.py` | rating construction and the 6-hourly self-refresh |
 | `fetch_oe.py`, `fetch_lol_players.py` | Oracle's Elixir ingestion (the LoL player data) |
+| `fetch_esports_players.py`, `compare_esports_players.py` | research-only Dota/CS2 player bootstrap download, integrity audit, and chronological same-source comparison |
 | `backtest.py`, `tune.py` | walk-forward evaluation and hyperparameter fitting |
 | `manual_trades.py` | human-entered bet tracking (separate table) |
 

@@ -180,7 +180,8 @@ ROSTER_REACCEPT_MATCHES = 15   # games under the new lineup before trusting the 
 # vlr.gg mirror (Valorant) — see elo/esports.py for caveats, especially
 # roster changes, which team-level Elo can't see.
 SUPPORTED_SPORTS = {
-    "MLB": "mlb",
+    "MLB": "mlb",  # re-enabled 2026-07-18 on the ESPN source (statsapi.mlb.com
+                   # blocks the droplet IP; see elo/mlb.py + OPERATOR.md §11)
     "NBA": "nba",
     "WNBA": "wnba",
     "ATP": "atp",
@@ -318,18 +319,54 @@ CANCEL_UNFILLED_AFTER_MIN = 10
 # only DISCOVERY metadata (slugs, teams, start times); entry prices always
 # come from a fresh per-market bbo call each cycle, so the catalog can be
 # refreshed slowly and reused in between without staling any price.
+# THE structural defense (added 2026-07-17 after the ban loop): a global
+# token-bucket governor in api_guard.pace() that EVERY exchange HTTP call
+# passes through (wired at client construction via api_guard.governed()).
+# Worst case = SUSTAINED*60 + BURST calls in any minute (~100 at defaults) —
+# under the rate that even quiet-hour catalog bursts survived, so the bot
+# cannot exceed the budget no matter how busy a match window gets; calls
+# queue for a moment instead of bursting. 0 disables (don't).
+API_SUSTAINED_CALLS_PER_SEC = 1.5
+API_BURST_CALLS = 10
 MARKET_LIST_REFRESH_MIN = 10   # catalog refetch cadence (0 = refetch every cycle)
 MARKET_LIST_MAX_AGE_MIN = 60   # if refetches keep FAILING, stop serving a catalog
                                # older than this (skip discovery; stale start
                                # times could mislabel a postponed match pregame)
-MARKET_PAGE_SPACING_SEC = 0.25 # pause between catalog pagination calls
-                               # (~90-call burst in ~6s -> a drip over ~30s)
+MARKET_PAGE_SPACING_SEC = 1.0  # pause between catalog pagination calls.
+                               # 0.25 (a ~115-call drip over ~30s, ~4 req/s)
+                               # still tripped Cloudflare on 2026-07-17 whenever
+                               # a busy match window stacked settlement/CLV
+                               # calls on top; 1.0 spreads the catalog over
+                               # ~2 min at ~1 req/s, well under the limit.
+# Catalog page size and server-side category filter (probed 2026-07-17):
+# the API serves up to 500 markets/page (hard cap — asking for more still
+# returns 500, which is why fetch_all_markets clamps to 500: a full server
+# page would otherwise look like a final short page and silently truncate
+# the catalog) and honors categories=["sports"] server-side. Together they
+# shrink the refetch from ~115 calls to ~20. Empty MARKET_CATEGORIES = no
+# filter (fetch everything, as before).
+MARKET_PAGE_SIZE = 500
+MARKET_CATEGORIES = ("sports",)
 # If the exchange answers with a Cloudflare BAN page anyway, pause all
 # exchange calls this long so the ban can expire — hammering through resets
 # Cloudflare's rolling window and extends it. Pausing is safe: fills,
 # settlements, and reconciliation all catch up when calls resume (proven
 # during the 3h ban on 2026-07-16 — zero money lost).
 API_BAN_COOLDOWN_MIN = 5
+# Repeated bans escalate: each ban detected within RECENT_MIN of the previous
+# one doubles the pause (5 -> 10 -> 20 -> capped at MAX_MIN), because a re-ban
+# right after resuming means Cloudflare's window is still hot and 5 min flat
+# just re-triggers it (11 ban episodes in 2h on 2026-07-17). A ban later than
+# RECENT_MIN after the last one is a fresh incident and starts back at 5.
+API_BAN_COOLDOWN_MAX_MIN = 40
+API_BAN_RECENT_MIN = 15
+# After a ban ends, the full catalog refetch (the heaviest burst we make) is
+# the LAST thing to send at a still-warm rate limiter — it's what re-tripped
+# the ban again and again on 2026-07-17 (cache expires during the pause, so
+# the first post-resume cycle refired all ~115 pages and got re-banned in
+# seconds). Keep serving the cached catalog this long after any ban before
+# allowing a refetch (bounded by MARKET_LIST_MAX_AGE_MIN as always).
+POST_BAN_CATALOG_GRACE_MIN = 10
 # A settled row whose POSITION_RESOLUTION never appears on the activity feed
 # (exchange quirk — a won MLB row from 2026-07-12 and a voided dota2 push
 # both never got one) can never reconcile; without a give-up, each such row
