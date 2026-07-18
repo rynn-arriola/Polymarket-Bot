@@ -42,7 +42,8 @@ def compare(title: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("titles", nargs="*", choices=("dota2", "cs2"), default=("dota2", "cs2"))
+    parser.add_argument("titles", nargs="*", choices=("dota2", "cs2", "valorant"),
+                        default=("dota2", "cs2", "valorant"))
     args = parser.parse_args()
     for requested in args.titles:
         compare(requested)
