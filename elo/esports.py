@@ -653,6 +653,13 @@ def load_cs2_games() -> list[dict]:
     return _lineup_games("esports_cs2_lineups.json")
 
 
+def _canonical_cs2_lineup(game: dict) -> bool:
+    sides = list(game.get("teams", {}).values())
+    return (len(sides) == 2 and all(len(players) >= 3 for players in sides)
+            and all(str(player).startswith("cs2:")
+                    for players in sides for player in players))
+
+
 # CS2 lineups: bo3.gg's match LIST endpoint carries all 10 players per row
 # (~100 matches/call, keyless). Attribution is self-validating — each player
 # row's team_id either matches one of the two match teams or the player is
@@ -708,9 +715,7 @@ def deepen_cs2_player_data():
                 continue
             eligible_on_page += 1
             existing = lineups.get(mid)
-            if existing and all(str(player).startswith("cs2:")
-                                for players in existing.get("teams", {}).values()
-                                for player in players):
+            if existing and _canonical_cs2_lineup(existing):
                 continue
             sides: dict = {id1: [], id2: []}
             from elo.esports_players import cs2_player_key
@@ -736,11 +741,15 @@ def deepen_cs2_player_data():
             consecutive_known = 0
         offset += 100
         time.sleep(0.3)
-    if added:
+    legacy = [mid for mid, game in lineups.items() if not _canonical_cs2_lineup(game)]
+    for mid in legacy:
+        del lineups[mid]
+    if added or legacy:
         STORE_DIR.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(lineups, f)
-    log.info(f"cs2 lineup capture: +{added} this run, {len(lineups)} total")
+    log.info(f"cs2 lineup capture: +{added} this run, {len(lineups)} total "
+             f"({len(legacy)} unresolved legacy rows removed)")
 
 
 def _apply_inactivity_decay(engine: EloEngine, team: str, game_day, last_played: dict, p: dict):

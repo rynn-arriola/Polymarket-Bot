@@ -123,6 +123,28 @@ class ForwardLoaderTests(unittest.TestCase):
         self.assertEqual(1, len(games))
         self.assertEqual("new", games[0]["source_id"])
 
+    def test_cs2_collector_prunes_unresolved_legacy_rows(self):
+        rows = {
+            "old": {"date": "2026-01-01", "teams": {"A": ["1", "2", "3"],
+                                                       "B": ["4", "5", "6"]},
+                    "winner": "A"},
+            "new": {"date": "2026-01-02", "teams": {"A": ["cs2:a", "cs2:b", "cs2:c"],
+                                                       "B": ["cs2:d", "cs2:e", "cs2:f"]},
+                    "winner": "B"},
+            "partial": {"date": "2026-01-03", "teams": {"A": ["cs2:a"],
+                                                           "B": ["cs2:d"]},
+                        "winner": "A"},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            store_dir = Path(temporary)
+            path = store_dir / "esports_cs2_lineups.json"
+            path.write_text(json.dumps(rows), encoding="utf-8")
+            with (patch.object(esports, "STORE_DIR", store_dir),
+                  patch.object(esports.history, "_get_json", return_value={"results": []})):
+                esports.deepen_cs2_player_data()
+            cleaned = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(["new"], list(cleaned))
+
     def test_audit_reports_largest_gap(self):
         games = [{"date": "2026-01-01", "source": "x"},
                  {"date": "2026-01-04", "source": "x"}]
