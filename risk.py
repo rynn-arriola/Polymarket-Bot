@@ -111,7 +111,7 @@ def risk_check(sport: str, event_id: str, market_slug_: str,
     loss_limit = loss_baseline * config.DAILY_LOSS_LIMIT_PCT
     if day_pnl <= -loss_limit:
         return (f"DAILY LOSS LIMIT hit ({day_pnl:.2f}, limit -{loss_limit:.2f} "
-                f"= {config.DAILY_LOSS_LIMIT_PCT:.0%} of ${loss_baseline:.2f} day-open balance) — halted for today")
+                f"= {config.DAILY_LOSS_LIMIT_PCT:.1%} of ${loss_baseline:.2f} day-open balance) — halted for today")
 
     committed = db(
         "SELECT COALESCE(SUM(stake),0) FROM positions WHERE status IN ('pending','open') AND live=?",
