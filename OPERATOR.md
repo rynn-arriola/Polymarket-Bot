@@ -285,10 +285,20 @@ Then, off the back of those:
 ## 6. What's automatic (never action these)
 
 - Market scan, entries, fill confirmation, cancels: every **60 s**.
-- The market **catalog** (the ~9,000-market list) refetches every
-  **10 min** (`MARKET_LIST_REFRESH_MIN`), paced, and is reused in between —
-  it's discovery metadata only; **entry prices always come from a fresh
-  per-market bbo call every cycle.** This is the rate-limit fix; see
+- **Rate-limit governor:** every exchange HTTP call passes through a global
+  token bucket (`api_guard.pace()`, `API_SUSTAINED_CALLS_PER_SEC = 1.5` +
+  `API_BURST_CALLS = 10` ≈ 100 calls/min worst case) — the bot structurally
+  cannot exceed the call budget; busy windows queue calls for a moment
+  instead of bursting. The standalone diagnostics (`audit_reporting`,
+  `repair_miscancelled`, `manual_trades sync`, `fix_manual_signs`) are
+  governed the same way. An occasional "API pacing engaged" log line is the
+  governor working, not a fault.
+- The market **catalog** refetches every **10 min**
+  (`MARKET_LIST_REFRESH_MIN`) as a paced ~20-call drip (500 markets/page —
+  the server's cap — filtered server-side to `MARKET_CATEGORIES =
+  ("sports",)`), and is reused in between — it's discovery metadata only;
+  **entry prices always come from a fresh per-market bbo call every cycle.**
+  This is the rate-limit fix; see
   [History](#11-history-incidents-and-what-they-taught).
 - Cloudflare-ban circuit breaker: if the exchange answers with a ban page
   (error 1015), all exchange calls pause `API_BAN_COOLDOWN_MIN = 5` min so
@@ -563,9 +573,14 @@ both cost real money, and both look like over-engineering until you know why.
   (2) the flat 5-min cooldown looped: the catalog cache expired *during* the
   pause, so the first post-resume cycle refired the full burst at a still-warm
   rate limiter and was re-banned in seconds — and some resumes hit a
-  still-active ban outright. Fixes: page spacing 0.25 s → 1.0 s (~2 min drip),
-  escalating cooldown on repeat bans (5 → 10 → 20 → 40 min cap,
-  `API_BAN_COOLDOWN_MAX_MIN`), and a 10-min post-ban grace during which the
+  still-active ban outright. Fixes, in order of importance: (a) **the global
+  token-bucket governor** — every exchange call now passes `api_guard.pace()`
+  (`API_SUSTAINED_CALLS_PER_SEC`/`API_BURST_CALLS`), so the aggregate rate is
+  capped by construction; (b) the catalog shrunk ~6x (500/page server cap +
+  server-side `categories=["sports"]` filter, probed live 2026-07-17) and its
+  page spacing went 0.25 s → 1.0 s; (c) escalating cooldown on repeat bans
+  (5 → 10 → 20 → 40 min cap, `API_BAN_COOLDOWN_MAX_MIN`), measured from the
+  previous cooldown's END; (d) a 10-min post-ban grace during which the
   cached catalog is served instead of refetched
   (`POST_BAN_CATALOG_GRACE_MIN`).
 
@@ -656,7 +671,7 @@ handle it. Paste the output.
 | `pull_server_state.py` | **daily.** Pulls live DB + server ratings DOWN into `server_mirror/`. One-way; the only backup of the live money record. |
 | `repair_miscancelled.py` | standing repair tool for wrongly-cancelled rows |
 | `name_match.py` | Polymarket name → Elo name resolution (exact → alias → fuzzy) |
-| `api_guard.py` | Cloudflare-ban detection + cooldown (the rate-limit circuit breaker) |
+| `api_guard.py` | the rate-limit layer: token-bucket governor on every exchange call (`pace()`/`governed()`) + Cloudflare-ban detection with escalating cooldown |
 | `elo/` | the rating engines — `engine`, `basketball`, `tennis`, `mlb`, `soccer`, `esports`, `lol_players`, `rosters`, `injuries`, `history`, `params` |
 | `xgb_live.py` | the **gated** XGBoost override + shared feature builders |
 | `train_xgb.py`, `xgb_features.py` | XGBoost training + walk-forward extractors |

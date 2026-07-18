@@ -74,12 +74,15 @@ except ImportError:
 
 
 def make_client(authenticated: bool) -> "PolymarketUS":
+    # governed() routes every HTTP call through api_guard's token bucket —
+    # the "never hit the rate limit again" layer (see config.py).
     if authenticated:
         if "PASTE_YOUR" in config.KEY_ID or "PASTE_YOUR" in config.SECRET_KEY:
             log.error("API keys not set in config.py — live mode needs them.")
             sys.exit(1)
-        return PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY)
-    return PolymarketUS()
+        return api_guard.governed(
+            PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY))
+    return api_guard.governed(PolymarketUS())
 
 
 # ------------------------------------------------------------------
@@ -220,10 +223,17 @@ def fetch_all_markets(client) -> list:
         return []
 
     spacing = getattr(config, "MARKET_PAGE_SPACING_SEC", 0.25)
+    # 500 is the server's hard page cap (probed 2026-07-17). Clamp because a
+    # larger configured value would make a full 500-row server page look like
+    # a final short page and silently truncate the catalog.
+    page_size = min(getattr(config, "MARKET_PAGE_SIZE", 500), 500)
+    categories = list(getattr(config, "MARKET_CATEGORIES", ()) or ())
     markets, offset = [], 0
     try:
         while True:
-            params = {"limit": 100, "offset": offset, "active": True, "closed": False}
+            params = {"limit": page_size, "offset": offset, "active": True, "closed": False}
+            if categories:
+                params["categories"] = categories
             paginated = True
             try:
                 page = client.markets.list(params)
@@ -239,9 +249,9 @@ def fetch_all_markets(client) -> list:
                 # refetch this same first page, so stop after one.
                 log.warning("markets.list rejected pagination params — only the first page was fetched")
                 break
-            if len(batch) < 100:
+            if len(batch) < page_size:
                 break
-            offset += 100
+            offset += page_size
             if offset >= 20000:
                 log.warning("Pagination cap hit at 20000 — market list may be incomplete")
                 break

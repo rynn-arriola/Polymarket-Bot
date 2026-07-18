@@ -93,6 +93,77 @@ def cooldown_remaining() -> float:
     return max(0.0, _ban_until - time.monotonic())
 
 
+# ------------------------------------------------------------------
+# Token-bucket governor — the structural "never hit the limit" layer.
+# Every exchange HTTP call passes through pace() (wired in via governed()
+# at client construction), so the aggregate rate is capped no matter which
+# subsystem gets busy. The ban detection above stays as the backstop for
+# the day Cloudflare changes its thresholds.
+# ------------------------------------------------------------------
+
+_tokens: float | None = None  # None = bucket not initialized yet
+_last_refill = 0.0
+_throttled_accum = 0.0   # seconds spent waiting since the last pacing log
+_throttled_logged = 0.0
+
+def pace() -> None:
+    """Block until the global call budget allows one more exchange call.
+
+    Standard token bucket: capacity API_BURST_CALLS, refilled at
+    API_SUSTAINED_CALLS_PER_SEC. Worst-case sustained rate is therefore
+    rate*60 + burst calls in any minute — keep that comfortably under
+    Cloudflare's threshold and a ban is structurally impossible, not just
+    unlikely. Waits are short (sub-second) in normal operation; a busy
+    match window queues calls instead of bursting them. Single-threaded
+    by assumption (the bot's refresh runs as a separate process)."""
+    global _tokens, _last_refill, _throttled_accum, _throttled_logged
+    rate = getattr(config, "API_SUSTAINED_CALLS_PER_SEC", 1.5)
+    burst = max(1, getattr(config, "API_BURST_CALLS", 10))
+    if rate <= 0:  # 0 disables the governor
+        return
+    now = time.monotonic()
+    if _tokens is None:
+        _tokens, _last_refill = float(burst), now
+    _tokens = min(float(burst), _tokens + (now - _last_refill) * rate)
+    _last_refill = now
+    if _tokens < 1.0:
+        wait = (1.0 - _tokens) / rate
+        time.sleep(wait)
+        _throttled_accum += wait
+        _tokens = 1.0
+        _last_refill = time.monotonic()
+        # Surface sustained throttling occasionally — it means we're living
+        # at the budget and the budget (not Cloudflare) is now the limiter.
+        if _throttled_accum >= 5 and time.monotonic() - _throttled_logged >= 300:
+            log.info(f"API pacing engaged — spread {_throttled_accum:.0f}s of "
+                     f"would-be burst over time (budget {rate}/s sustained, "
+                     f"burst {burst}). This is the governor working, not a fault.")
+            _throttled_accum = 0.0
+            _throttled_logged = time.monotonic()
+    _tokens -= 1.0
+
+
+def governed(client):
+    """Route every HTTP call of a PolymarketUS client through pace().
+
+    _request is the SDK's single choke point (get/post/delete all funnel
+    into it), so wrapping it here covers every endpoint — catalog pages,
+    bbo, orders, portfolio, settlement, activity — with zero per-call-site
+    wiring. Idempotent: wrapping an already-governed client is a no-op.
+    Call this wherever a client is constructed."""
+    inner = getattr(client, "_request", None)
+    if inner is None or getattr(inner, "_api_guard_governed", False):
+        return client
+
+    def _paced_request(*args, **kwargs):
+        pace()
+        return inner(*args, **kwargs)
+
+    _paced_request._api_guard_governed = True
+    client._request = _paced_request
+    return client
+
+
 def seconds_since_ban_end() -> float | None:
     """Seconds since the last ban cooldown ended, or None if no ban has been
     seen this run. 0.0 while a cooldown is still active. Lets heavy callers

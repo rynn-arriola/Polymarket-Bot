@@ -182,7 +182,8 @@ def cmd_sync(_args):
     if not getattr(config, "LIVE", False):
         print("config.LIVE is False — manual sync only makes sense against the live account")
         return
-    auth = PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY)
+    import api_guard
+    auth = api_guard.governed(PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY))
     cashed, closed = manual_sync.detect_manual_cashouts(auth), manual_sync.sync_open_manual_trades(auth)
     print(f"bot positions cashed out by hand: {len(cashed)}")
     print(f"manual trades closed this pass:   {closed}")

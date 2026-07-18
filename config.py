@@ -318,6 +318,15 @@ CANCEL_UNFILLED_AFTER_MIN = 10
 # only DISCOVERY metadata (slugs, teams, start times); entry prices always
 # come from a fresh per-market bbo call each cycle, so the catalog can be
 # refreshed slowly and reused in between without staling any price.
+# THE structural defense (added 2026-07-17 after the ban loop): a global
+# token-bucket governor in api_guard.pace() that EVERY exchange HTTP call
+# passes through (wired at client construction via api_guard.governed()).
+# Worst case = SUSTAINED*60 + BURST calls in any minute (~100 at defaults) —
+# under the rate that even quiet-hour catalog bursts survived, so the bot
+# cannot exceed the budget no matter how busy a match window gets; calls
+# queue for a moment instead of bursting. 0 disables (don't).
+API_SUSTAINED_CALLS_PER_SEC = 1.5
+API_BURST_CALLS = 10
 MARKET_LIST_REFRESH_MIN = 10   # catalog refetch cadence (0 = refetch every cycle)
 MARKET_LIST_MAX_AGE_MIN = 60   # if refetches keep FAILING, stop serving a catalog
                                # older than this (skip discovery; stale start
@@ -328,6 +337,15 @@ MARKET_PAGE_SPACING_SEC = 1.0  # pause between catalog pagination calls.
                                # a busy match window stacked settlement/CLV
                                # calls on top; 1.0 spreads the catalog over
                                # ~2 min at ~1 req/s, well under the limit.
+# Catalog page size and server-side category filter (probed 2026-07-17):
+# the API serves up to 500 markets/page (hard cap — asking for more still
+# returns 500, which is why fetch_all_markets clamps to 500: a full server
+# page would otherwise look like a final short page and silently truncate
+# the catalog) and honors categories=["sports"] server-side. Together they
+# shrink the refetch from ~115 calls to ~20. Empty MARKET_CATEGORIES = no
+# filter (fetch everything, as before).
+MARKET_PAGE_SIZE = 500
+MARKET_CATEGORIES = ("sports",)
 # If the exchange answers with a Cloudflare BAN page anyway, pause all
 # exchange calls this long so the ban can expire — hammering through resets
 # Cloudflare's rolling window and extends it. Pausing is safe: fills,
