@@ -240,7 +240,12 @@ DRY_RUN_BANKROLL = 1000.00   # fixed simulated bankroll for DRY-RUN, decoupled f
 # account up and down instead of being pinned to a fixed dollar amount.
 # MIN_STAKE stays an ABSOLUTE floor: contracts are whole units priced
 # $0.05-$0.95, so a sub-$1 stake can buy zero of them.
-STAKE_PCT = 0.01             # flat sizing: 1% of bankroll per bet (ACTIVE — Kelly off below)
+STAKE_PCT = 0.0025           # flat sizing: 0.25% of bankroll per bet (ACTIVE — Kelly off below).
+                             # Reduced from 1% on 2026-07-18 (operator call): still in the
+                             # data-gathering phase — CLV hasn't validated the edge yet, so keep
+                             # real-money exposure minimal while the sample accumulates. Note at
+                             # ~$555 bankroll this is ~$1.39/bet; below ~$400 bankroll the $1
+                             # MIN_STAKE floor takes over and sizing is effectively flat $1.
 KELLY_FRACTION = 0           # 0 = Kelly OFF, every bet is a flat STAKE_PCT of bankroll.
                              # (Was 0.25 quarter-Kelly until 2026-07-12 — edge-scaled bets
                              # kept hitting the 2% MAX_STAKE_PCT cap; restore 0.25 to re-enable.)
