@@ -180,7 +180,12 @@ ROSTER_REACCEPT_MATCHES = 15   # games under the new lineup before trusting the 
 # vlr.gg mirror (Valorant) — see elo/esports.py for caveats, especially
 # roster changes, which team-level Elo can't see.
 SUPPORTED_SPORTS = {
-    "MLB": "mlb",
+    # "MLB": "mlb",  # PAUSED 2026-07-18: statsapi.mlb.com blocks the droplet
+    #                # IP (406) since ~07-10 — ratings can't get fresher than
+    #                # 2026-07-08, and a stale model vs an informed market is
+    #                # the adverse-selection trap. Re-enable when the source
+    #                # works from the server again (test: the elo/mlb.py
+    #                # probable_pitchers fetch, or curl the MLB_SCHEDULE URL).
     "NBA": "nba",
     "WNBA": "wnba",
     "ATP": "atp",
