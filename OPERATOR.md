@@ -386,7 +386,7 @@ against exactly this. Do not weaken them to get more volume.
 | FWC (World Cup) | ESPN | **0.2026** | draw-decomposed; thin sample, treat with skepticism |
 | ATP | TML-Database | **0.2180** | real surface labels; surface blend earns its keep |
 | WTA | ESPN | **0.2278** | no TML-style mirror exists for WTA |
-| MLB | MLB Stats API | **0.2437** | weakest; ceiling looks structural (see dead ends) |
+| MLB | MLB Stats API | **0.2437** | **PAUSED 2026-07-18** — statsapi.mlb.com blocks the droplet IP (406) since ~07-10, so ratings can't stay current. Re-enable: verify the fetch works from the server across a day, then uncomment `"MLB"` in `config.SUPPORTED_SPORTS`, deploy, restart. If the block persists: ESPN carries MLB scores (source swap), or seed `data/cache/mlb_2026.json` from a residential IP (same precedent as the manual ITF CSV drop). |
 | LoL | Leaguepedia + Oracle's Elixir | **0.2102** (XGB blend) | **the one active XGBoost model** — see below |
 | Dota 2 | PandaScore | **0.2146** | 34.8k matches; + dormancy regression |
 | CS2 | PandaScore | **0.2250** | 51.9k matches; + dormancy regression |
@@ -583,6 +583,22 @@ both cost real money, and both look like over-engineering until you know why.
   previous cooldown's END; (d) a 10-min post-ban grace during which the
   cached catalog is served instead of refetched
   (`POST_BAN_CATALOG_GRACE_MIN`).
+- **The invisible MLB freeze (2026-07-18).** statsapi.mlb.com started
+  blocking the droplet's IP (~2026-07-10; origin-level 406, all header
+  variants, residential IPs unaffected). Two cache bugs turned a blocked
+  source into silent model damage: a failed probable-pitcher fetch cached an
+  EMPTY pitcher map for its full 30-min TTL, and — far worse — a failed
+  `cached_chunk` refetch returned `[]` while ignoring the good cache on
+  disk, so the season-sized `mlb_2026` chunk vanished from every 6h rebuild
+  and live MLB Elo regressed to end-of-2025 ratings for a week. The
+  freshness guard saw nothing: it keys on `last_built`, which kept updating
+  (known gap: it ignores `latest_game_date`). 12 real bets rode the frozen
+  ratings (7 settled +$14.16 — luck; 5 open). Fixes: both caches now serve
+  their last good answer on a failed fetch and retry soon (pitcher: 2 min;
+  chunk: next build), and **MLB trading is paused** until the source works
+  from the server again (see the models table). The recurring lesson, third
+  instance of the same class after the 07-14 `None`-that-meant-two-things:
+  **a fetch that FAILED must never be recorded as an answer.**
 
 ---
 
