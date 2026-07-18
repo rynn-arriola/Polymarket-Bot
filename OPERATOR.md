@@ -328,8 +328,8 @@ Then, off the back of those:
   without a restart. Trading never pauses; a hung rebuild can't take the bot
   down (last-good ratings stay live).
 - Player-data collection (Dota 2 + CS2): each refresh also captures per-match
-  lineups — Dota from OpenDota (up to 300/run into
-  `data/cache/esports_dota2_lineups.json`; ~5–10 min inside the background
+  lineups — Dota from OpenDota (up to 450/run into
+  `data/cache/esports_dota2_lineups.json`; ~8–12 min inside the background
   refresh, under OpenDota's 2,000-calls/day free tier) and CS2 from bo3.gg
   (`esports_cs2_lineups.json`; forward-only, last-30-days window, a handful
   of calls). Groundwork for future player models (see the XGBoost status in
@@ -434,8 +434,8 @@ pattern applied to the sports where roster churn hurts most:
 | Title | Player data | Status |
 |---|---|---|
 | LoL | Oracle's Elixir CSVs | **have it** — powers the live blend |
-| Dota 2 | OpenDota per-match lineups | **collector live in the 6h refresh** — ~18-month backfill completes in ~3–4 weeks; a player model becomes trainable (on xgboost-dev, activated only via the usual XGB gates) once the store is deep |
-| CS2 | bo3.gg per-match players | **forward-only collector live in the 6h refresh (since 2026-07-16)** — players carry only their *current* team, so history can't be side-split: the store grows only from deploy day (~1.5k tier s–c matches/month) |
+| Dota 2 | OpenDota collector + published pro-match Parquet | **research bootstrap built 2026-07-18 on `codex/dota-cs2-player-bootstrap`, not live.** `darianogina/dota-2-matches-pro-leagues` contains 193,773 raw maps / 191,202 usable merged games with stable player ids. Real archive audit found it ends **2024-10-15**, leaving a 638-day gap to the current OpenDota collector. Server audit before acceleration: 1,006/39,917 lineups captured (2.5%, 38,911 pending). The 2026-07-18 00:08 UTC refresh proved the old `added=0` path could walk into HTTP 429 before lineup capture. The completed id walk now stops after two known pages and the lineup batch rises 300→450 per 6h run, reducing the estimate from ~32 to ~22 days while remaining under 2,000 calls/day. Chronological same-source test: player Elo 0.2356 vs team Elo 0.2458 over 23,898 maps, but that universe is not comparable to production PandaScore's 0.2146 series-level Brier. Bulk/OpenDota overlap is keyed by the shared match id: bulk wins the merge, and the collector skips per-match API calls for ids already in the Parquet. Useful cold start; **does not clear the live gate**. |
+| CS2 | bo3.gg forward collector + parsed-demo metadata | **research bootstrap built 2026-07-18 on `codex/dota-cs2-player-bootstrap`, not live.** The initially considered Kaggle HLTV dataset was **rejected**: a May 2024 Spirit row contains later roster members, proving its player columns leak current rosters backward. Replacement `blanchon/cs2_dataset_demo` is replay-grounded and yields 1,000 exact maps (2026-03-23–04-20). The bo3 nickname migration was driven against the real endpoint locally: 472 stored rows / 4,297 player entries, all canonical nickname keys and zero legacy ids. Combined audit: 1,472 maps, a 59-day source gap, and **83 eligible test predictions** — still below the 100-game minimum, so there is no model verdict and no live activation. Its metadata is CC-BY, but the publisher says original tournament terms may still apply; provenance/usage review is another required pre-live gate. |
 | Valorant | Kaggle VCT dataset (found 2026-07-18) | **viable, not yet built.** `ryanluong1/valorant-champion-tour-2021-2023-data` (title says 2021–2026): per-map 5-player lineups + rich stats, MIT, ~monthly updates (last 2026-06-26), anonymously downloadable — the Oracle's-Elixir pattern, zero scraping by us. Verified 2026-07-18 on the real archive. Caveats for the eventual build: **no dates** (order by Match ID — vlr assigns them ~chronologically), ~7% of scores rows have team-name/Match-Name mismatches (**join on Team IDs**, as the author warns), China-hosted matches missing stats, and updates lag up to ~a month (needs an OE-style staleness gate). Build waits until the Dota/CS2 collectors prove the player-model pattern. The 07-16 "no free per-match source" conclusion was true for APIs but missed published datasets. |
 
 ### Name matching — the highest-maintenance part of the system
@@ -700,6 +700,7 @@ handle it. Paste the output.
 | `train_xgb.py`, `xgb_features.py` | XGBoost training + walk-forward extractors |
 | `build_ratings.py`, `refresh_data.py`, `refresh.py` | rating construction and the 6-hourly self-refresh |
 | `fetch_oe.py`, `fetch_lol_players.py` | Oracle's Elixir ingestion (the LoL player data) |
+| `fetch_esports_players.py`, `compare_esports_players.py` | research-only Dota/CS2 player bootstrap download, integrity audit, and chronological same-source comparison |
 | `backtest.py`, `tune.py` | walk-forward evaluation and hyperparameter fitting |
 | `manual_trades.py` | human-entered bet tracking (separate table) |
 
