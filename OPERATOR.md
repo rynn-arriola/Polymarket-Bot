@@ -386,7 +386,7 @@ against exactly this. Do not weaken them to get more volume.
 | FWC (World Cup) | ESPN | **0.2026** | draw-decomposed; thin sample, treat with skepticism |
 | ATP | TML-Database | **0.2180** | real surface labels; surface blend earns its keep |
 | WTA | ESPN | **0.2278** | no TML-style mirror exists for WTA |
-| MLB | MLB Stats API | **0.2437** | **PAUSED 2026-07-18** — statsapi.mlb.com blocks the droplet IP (406) since ~07-10, so ratings can't stay current. Re-enable: verify the fetch works from the server across a day, then uncomment `"MLB"` in `config.SUPPORTED_SPORTS`, deploy, restart. If the block persists: ESPN carries MLB scores (source swap), or seed `data/cache/mlb_2026.json` from a residential IP (same precedent as the manual ITF CSV drop). |
+| MLB | ESPN | **0.2437** | source swapped from statsapi.mlb.com 2026-07-18 (it blocks the droplet's IP — see §11); ESPN carries results **and** probable starters, ids are ESPN athlete ids end to end. Brier identical on the new source. |
 | LoL | Leaguepedia + Oracle's Elixir | **0.2102** (XGB blend) | **the one active XGBoost model** — see below |
 | Dota 2 | PandaScore | **0.2146** | 34.8k matches; + dormancy regression |
 | CS2 | PandaScore | **0.2250** | 51.9k matches; + dormancy regression |
@@ -599,6 +599,13 @@ both cost real money, and both look like over-engineering until you know why.
   from the server again (see the models table). The recurring lesson, third
   instance of the same class after the 07-14 `None`-that-meant-two-things:
   **a fetch that FAILED must never be recorded as an answer.**
+  *Resolution, same day:* MLB was switched to **ESPN** (results + probables,
+  reachable from the droplet, walk-forward Brier identical at 0.2437) and
+  re-enabled. Two traps found en route, recorded here because they'll recur:
+  ESPN team names are **era-accurate** ("Oakland Athletics" pre-2025), so
+  aliases must apply *before* any current-name whitelist or a renamed team's
+  entire history silently vanishes; and ESPN dates are UTC — statsapi's were
+  US-local — so date-keyed joins must not carry over local-date workarounds.
 
 ---
 
