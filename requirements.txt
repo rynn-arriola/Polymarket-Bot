@@ -7,3 +7,6 @@ tzdata
 # imports it directly, not merely as an xgboost transitive dep.
 xgboost>=2.0
 numpy>=1.24
+
+# Historical Dota player-lineup bootstrap is published as Parquet.
+pyarrow>=15.0
