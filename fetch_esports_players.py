@@ -1,10 +1,11 @@
-"""Download the free Dota 2 and CS2 player-lineup bootstrap archives."""
+"""Download the free Dota 2, CS2, and Valorant player-lineup archives."""
 
 import argparse
 import json
 import logging
 import urllib.request
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 from elo import esports_players
@@ -17,6 +18,13 @@ DATASETS = {
         "url": "https://www.kaggle.com/api/v1/datasets/download/darianogina/dota-2-matches-pro-leagues",
         "archive": "dota2_matches_kaggle.zip",
         "member": "dota2_matches.parquet",
+    },
+    "valorant": {
+        "url": ("https://www.kaggle.com/api/v1/datasets/download/"
+                "ryanluong1/valorant-champion-tour-2021-2023-data"),
+        "metadata_url": ("https://www.kaggle.com/api/v1/datasets/view/"
+                         "ryanluong1/valorant-champion-tour-2021-2023-data"),
+        "archive": "vct_2021_2026_kaggle_2026-06-26.zip",
     },
 }
 
@@ -77,11 +85,71 @@ def fetch_cs2(force: bool = False):
     log.info("cs2 audit: %s", esports_players.audit_games(games))
 
 
+def _valorant_metadata() -> dict:
+    spec = DATASETS["valorant"]
+    request = urllib.request.Request(spec["metadata_url"],
+                                     headers={"User-Agent": "divergence-bot/1.0"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        raw = json.load(response)
+    updated = raw.get("lastUpdated")
+    version = raw.get("currentVersionNumber")
+    if not updated or version is None:
+        raise RuntimeError("Kaggle returned incomplete Valorant metadata")
+    datetime.fromisoformat(updated.replace("Z", "+00:00"))
+    return {
+        "source": spec["metadata_url"],
+        "download": spec["url"],
+        "title": raw.get("title"),
+        "license": raw.get("licenseName"),
+        "last_updated": updated,
+        "version": version,
+    }
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_json_atomic(path: Path, value: dict):
+    temporary = path.with_suffix(path.suffix + ".part")
+    temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def fetch_valorant(force: bool = False, audit: bool = True):
+    spec = DATASETS["valorant"]
+    directory = esports_players.DATA_DIRS["valorant"]
+    directory.mkdir(parents=True, exist_ok=True)
+    archive = directory / spec["archive"]
+    manifest = directory / "source.json"
+    previous = _read_json(manifest)
+    metadata = _valorant_metadata()
+    if previous:
+        changed = previous.get("version") != metadata["version"]
+    else:
+        inferred = esports_players.valorant_source_metadata(manifest, archive)
+        changed = (str(inferred.get("last_updated") or "")[:10]
+                   != str(metadata["last_updated"])[:10])
+    if force or not archive.exists() or changed:
+        log.info("Downloading Valorant VCT bootstrap")
+        _download(spec["url"], archive)
+    _write_json_atomic(manifest, metadata)
+    if audit:
+        games = esports_players.load_games("valorant")
+        log.info("valorant audit: %s", esports_players.audit_games(games))
+    return metadata
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("titles", nargs="*", choices=("dota2", "cs2"),
-                        default=("dota2", "cs2"))
+    parser.add_argument("titles", nargs="*", choices=("dota2", "cs2", "valorant"),
+                        default=("dota2", "cs2", "valorant"))
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     for requested in args.titles:
-        (fetch_dota if requested == "dota2" else fetch_cs2)(args.force)
+        {"dota2": fetch_dota, "cs2": fetch_cs2,
+         "valorant": fetch_valorant}[requested](args.force)

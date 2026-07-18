@@ -119,6 +119,13 @@ def load_matrix(sport: str):
             raise SystemExit("no OE data in data/oe — run fetch_oe.py first")
         X, y, dates = xf.extract_lol_players(games)
         feats = xf.LOL_FEATURES
+    elif sport == "valorant":
+        from elo import esports_players
+        games = esports_players.load_games("valorant")
+        if not games:
+            raise SystemExit("no Valorant VCT data - run fetch_esports_players.py valorant")
+        X, y, dates = xf.extract_esports_players(games, "valorant", 32.0)
+        feats = xf.PLAYER_FEATURES
     elif sport in xgb_live.ESPORTS_TITLES:
         from elo import esports
         if OFFLINE:

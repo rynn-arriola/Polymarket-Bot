@@ -13,6 +13,7 @@ Usage:
 
 import json
 import logging
+import os
 import sys
 from datetime import date, datetime, timezone
 
@@ -24,6 +25,13 @@ log = logging.getLogger("build_ratings")
 
 RATINGS_FILE = "elo_ratings.json"
 FRESHNESS_FILE = "elo_freshness.json"
+
+
+def _write_json_atomic(path: str, value: dict):
+    temporary = f"{path}.part"
+    with open(temporary, "w") as handle:
+        json.dump(value, handle)
+    os.replace(temporary, path)
 
 
 def _sanity_check(name: str, engine, n_games: int):
@@ -87,6 +95,17 @@ def build_all(sports: list[str] | None = None):
                                  f"{len(model['ratings'])} players)")
                 except Exception as e:
                     log.warning(f"LoL player-model build skipped: {e}")
+            if title == "valorant":
+                try:
+                    from elo import esports_players
+                    model = esports_players.build_valorant_live_model()
+                    if model:
+                        _write_json_atomic("valorant_player_model.json", model)
+                        log.info("Wrote valorant_player_model.json (source %s, sequence %s, "
+                                 "%s players)", model["latest_date"],
+                                 model["latest_sequence"], len(model["ratings"]))
+                except Exception as e:
+                    log.warning(f"Valorant player-model build skipped: {e}")
 
     if "mlb" in sports:
         games = mlb.fetch_games(config.MLB_START_YEAR)
