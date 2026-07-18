@@ -125,8 +125,11 @@ Independent published datasets now provide free player-level history:
   lineups. Only 83 test predictions were eligible, below the 100 minimum, so
   there is no verdict. A roster-leaking Kaggle HLTV table was rejected.
 - Valorant: a free MIT-licensed VCT dataset has per-map five-player lineups and
-  stats through June 2026. Its loader and chronological evaluation remain to
-  be built, with Team-ID joins and a freshness gate required.
+  stats through June 2026. The exact-ID loader now accepts 26,470 maps. The
+  fixed LoL-style team/player blend cleared its five-seed research gate: XGB
+  median test Brier 0.2411 versus team Elo 0.2464 and player Elo 0.2452.
+  Production-universe matching, true-date/freshness handling, and live VLR
+  identity mapping remain required before activation.
 
 These are new-data experiments, not permission to retry dead context or
 recency features. All generated datasets remain research-only. A title can

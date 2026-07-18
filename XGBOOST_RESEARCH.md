@@ -119,16 +119,17 @@ positions table already) — so decay is observed, not assumed.
 | 2026-07-13 | Esports context features (exp 3: bo_format/tier/fatigue) | dota2 (1 test read), valorant (val-rejected, no read); cs2 test read +0.0006 (68k rows, 100% context) | dota2 +0.0006; valorant val-rejected; cs2 +0.0006 | **DEAD — full negative across all three titles.** Gain importance: elo features ~60x the context features — bo/tier/fatigue carry almost nothing Elo doesn't. Likely cause: store rows are SERIES results, so Bo-variance is partially absorbed into rating dynamics already. Side discovery: the enrichment tripled valorant's store (5.6k->17.4k, to 2021) and its Elo baseline improved (val Brier 0.2325->0.2256) — live-model retune candidate, see MODELS_TODO. |
 | 2026-07-18 | Dota 2 player-history bootstrap | dota2 (191,202 usable merged maps; 23,898 chronological tests) | player Elo 0.2356 vs same-universe team Elo 0.2458 | **PROMISING, RESEARCH ONLY.** The archive ends 2024-10-15 and initially had a 638-day gap to forward data. The comparison is map-level and same-source, not comparable to production PandaScore's 0.2146 series Brier. Wait for current OpenDota lineup coverage and matched production-baseline evaluation. |
 | 2026-07-18 | CS2 replay-history + forward bootstrap | cs2 (1,472 merged maps; 83 eligible tests) | no test verdict | **INSUFFICIENT SAMPLE.** Minimum is 100 eligible tests. The accepted history is replay-grounded; the earlier HLTV-table candidate was rejected after proving backward current-roster leakage. Keep collecting canonical bo3.gg lineups and use recent-source holdout evaluation. |
-| 2026-07-18 | Valorant player-source audit | valorant | dataset integrity audit only; model not run | **VIABLE SOURCE, BUILD PENDING.** Free VCT archive has per-map lineups/stats through June 2026. Chronology must use Match ID, joins must use Team IDs, China-hosted stats are incomplete, and monthly staleness must fail safe. |
+| 2026-07-18 | Valorant exact-ID player blend | valorant (26,470 accepted maps; 13,999 eligible feature rows; 2,100-map test) | validation: XGB 0.2390 vs team 0.2435 / player 0.2437; test: XGB median 0.2411 (0.2407-0.2413) vs team 0.2464 / player 0.2452 | **RESEARCH GATE CLEAR.** Fixed LoL feature set, player K=32 selected on validation, one test read over five seeds; deltas +0.0053/+0.0041 and every seed positive. Exact VLR Match-ID chronology and Team-ID anchors prevent display-name leakage. Not live-ready: map-level research is not directly comparable to PandaScore's series model, rows lack true dates, and live identity/freshness parity is unbuilt. |
 
 ## Current player-data priority (updated 2026-07-18)
 
-1. **Dota 2** — finish current OpenDota lineup capture, audit the remaining
+1. **Valorant** — research gate cleared; build true-date/freshness evidence,
+   match the VLR test universe to production series predictions, and prove
+   live team/player identity parity before considering activation.
+2. **Dota 2** — finish current OpenDota lineup capture, audit the remaining
    historical gap, then evaluate against matched production predictions.
-2. **CS2** — continue canonical forward collection and rerun after at least
+3. **CS2** — continue canonical forward collection and rerun after at least
    100 recent-source holdout predictions are eligible.
-3. **Valorant** — build the Team-ID-based loader and chronological audit, then
-   apply the same player-versus-production evaluation gate.
 4. **LoL** — already live; monitor CLV and win rate rather than retuning.
 
 Recency weighting and esports context remain closed negative experiments. New

@@ -93,13 +93,20 @@ probes through 2026-07-18:
       audit had 1,472 maps, a 59-day source gap, and only 83 eligible test
       predictions versus the 100 minimum. Tournament-data usage review is also
       required before any live use.
-- [x] **valorant free source FOUND, build pending**:
+- [x] **valorant bootstrap BUILT, RESEARCH GATE CLEAR 2026-07-18**:
       `ryanluong1/valorant-champion-tour-2021-2023-data` supplies per-map
       five-player lineups and stats, MIT licensed, and was current through
-      2026-06-26 when verified. Required safeguards: order chronologically by
-      VLR Match ID because rows have no dates, join score/stat rows on Team IDs
-      because about 7% of names mismatch, account for missing China-hosted
-      stats, and enforce a roughly monthly freshness gate.
+      2026-06-26 when verified. The exact-ID loader accepts 26,470/27,450 maps,
+      orders by VLR Match ID because rows have no dates, and rejects ambiguous
+      keys, ties, incomplete lineups, and players missing from the annual ID
+      table. Corrupted team labels are recovered only with a consistent Team-ID
+      anchor. Pure player Elo tied team Elo (0.2441 vs 0.2445). The fixed LoL
+      player-blend feature set then cleared validation and one five-seed test:
+      XGB median 0.2411 (range 0.2407-0.2413) vs team Elo 0.2464 and player Elo
+      0.2452, deltas +0.0053/+0.0041. **Not live-eligible yet**: this is a
+      map-level VLR universe, not the production PandaScore series universe;
+      no true dates exist; and live VLR player/team identity plus monthly
+      freshness/fallback behavior are not implemented.
 - [ ] Traditional sports (NBA/MLB/tennis...) player data — later; esports
       first (roster churn makes it matter most here).
 
