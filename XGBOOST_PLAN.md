@@ -44,10 +44,12 @@ Explicitly OUT of scope (for now):
 
 ## Phases
 
-**Phase 0 — Confirm the premise. ✅ ANSWERED 2026-07-13: NO lineups on the free plan.**
+**Phase 0 — Confirm the premise. ✅ ANSWERED 2026-07-13: no lineups on the
+PandaScore free plan.**
 Match payloads carry no player lists and the per-game detail endpoint returns HTTP 403
-(paid tier). → The player-Elo path (3a) is DEAD for dota2/cs2/valorant on free data;
-LoL keeps its player signal (Oracle's Elixir CSVs, independent of PandaScore).
+(paid tier). Therefore the player-Elo path was blocked through PandaScore;
+independent published sources found on 2026-07-18 reopen it below. LoL keeps
+its player signal (Oracle's Elixir CSVs, independent of PandaScore).
 **BUT the same probe confirmed the rank-2/3 features ARE in payloads we already fetch:**
 `number_of_games` (Bo1/Bo3/Bo5) and `tournament.tier` sit in every /matches/past item.
 → **Phase 3b is promoted to the flagship path.**
@@ -78,15 +80,16 @@ Brier below Elo − 0.002 on the untouched test slice. Pipeline, gate, baseline:
   own store, no new data). COST: the store keeps only (date, winner, loser) today;
   format/tier need a store-schema extension + one-time historical re-walk (~1.6k
   requests, same resumable pattern as the 2026-07-12 deep backfill).
-- 3a (player-aggregate features): **LoL only** (Oracle's Elixir per-game lineups).
-  Blocked for other esports unless a paid tier or new free source appears.
+- 3a (player-aggregate features), original scope: **LoL only** (Oracle's Elixir
+  per-game lineups). The new free sources that later appeared are covered in
+  the reopened player-data section below.
 
 **Phase 4 — Decide and document.**
 Any sport whose model clears `beats_elo` gets its file shipped; `xgb_live` activates it
 automatically on the server. Everything else stays on Elo. Record what won and lost so
 we never re-run a dead end (extends the "XGBoost verdict" note).
 
-## PROGRAM COMPLETE (2026-07-13) — final verdict
+## ORIGINAL PROGRAM COMPLETE (2026-07-13) — final verdict
 
 Phase 3 ran to the end of the free data. Results:
 - Recency weighting: DEAD, all 10 sports (staleness already lives in elo_exp).
@@ -97,13 +100,36 @@ Phase 3 ran to the end of the free data. Results:
   (val-rejected) and cs2 (+0.0006, 68k rows) — series-level results already
   absorb Bo-variance into rating dynamics.
 
-CONCLUSION: on free data, Elo is the ceiling everywhere except where
-player-level data exists (LoL). The proven pattern — orthogonal PLAYER data
-beats team ratings — generalizes to dota2/cs2/valorant only via paid lineups
-(PandaScore stats plans, restricted for betting usage; see MODELS_TODO).
+CONCLUSION AT THE TIME: on the sources then known, Elo was the ceiling
+everywhere except where player-level data existed (LoL). The paid-lineup
+assumption for dota2/cs2/valorant was superseded on 2026-07-18; see the
+reopened player-data section below.
 Do not run further feature experiments on the current columns: the ledger
 says everything tried, and re-running dead ends is how noise gets shipped.
 
 Side profits of the program, banked for the LIVE models: valorant store
 5.6k->17.4k and cs2 52k->88.6k matches (retune candidates on MODELS_TODO),
 plus the dormancy patch that came out of the same non-stationarity research.
+
+## PLAYER-DATA PROGRAM REOPENED (2026-07-18)
+
+The July 13 conclusion remains valid for the columns and sources tested then,
+but its claim that non-LoL player lineups require paid APIs is obsolete.
+Independent published datasets now provide free player-level history:
+
+- Dota 2: 191,202 usable historical maps with stable player ids, plus the
+  OpenDota forward collector. Player Elo beat same-universe team Elo 0.2356 to
+  0.2458 over 23,898 tests, but the historical archive ends 2024-10-15 and the
+  result is not comparable to the production PandaScore series model.
+- CS2: 1,000 replay-grounded historical maps plus canonical bo3.gg forward
+  lineups. Only 83 test predictions were eligible, below the 100 minimum, so
+  there is no verdict. A roster-leaking Kaggle HLTV table was rejected.
+- Valorant: a free MIT-licensed VCT dataset has per-map five-player lineups and
+  stats through June 2026. Its loader and chronological evaluation remain to
+  be built, with Team-ID joins and a freshness gate required.
+
+These are new-data experiments, not permission to retry dead context or
+recency features. All generated datasets remain research-only. A title can
+advance only after recent-source holdout testing beats its production Elo on
+matched games, train/serve player identity is proven, and live inference has a
+freshness-aware fallback.

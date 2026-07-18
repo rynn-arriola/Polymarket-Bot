@@ -47,42 +47,59 @@ to main without explicit approval.
       verdict pending (see decision board)
 - [x] Exp 3 esports context features — DEAD all three titles (dota2 +0.0006,
       valorant val-rejected, cs2 +0.0006 on 68k rows); ledgered
-- [x] **Phase 4 close-out DONE (2026-07-13)**: LoL blend = sole winner
-      (awaiting activation gates); everything else ruled out on free data;
-      final verdict written in XGBOOST_PLAN.md. No further feature
-      experiments on current columns.
+- [x] **Original Phase 4 close-out DONE (2026-07-13)**: LoL blend was the sole
+      winner on the sources known then. The verdict against further experiments
+      on the same columns still stands.
+- [ ] **Player-data phase reopened 2026-07-18** after finding independent free
+      lineup datasets for Dota 2, CS2, and Valorant. Dota/CS2 bootstrap and
+      source-integrity tooling are built; neither model is eligible for live use.
 
-## Player-data collection (the "new data" program — 2026-07-16)
+## Player-data collection (the "new data" program — updated 2026-07-18)
 
 The LoL blend proved the pattern: player-level data is the only feature class
-that ever beat Elo here. Per-title status of getting it (all sources probed
-live 2026-07-16):
+that ever beat Elo here. Per-title status after API and published-dataset
+probes through 2026-07-18:
 
 - [x] **LoL** — already have it (Oracle's Elixir CSVs; live blend feeds on it).
-- [x] **dota2 collector BUILT** (this branch): OpenDota proMatches walk into a
+- [x] **dota2 collector BUILT + ACCELERATED**: OpenDota proMatches walk into a
       separate OpenDota-id store (`esports_dota2_od_store.json` — never joined
       with the ps* live store) + per-match lineup capture
       (`esports_dota2_lineups.json`, LoL game shape `{date, teams, winner}`,
-      `load_dota_games()` reader). 300 lineup calls/run, 4 runs/day + walk
-      stays under OpenDota's 2000/day. ~18mo backfill completes in ~3-4 weeks.
-      Verified live (5 lineups, full 5v5, correct winner attribution; ps store
-      untouched). **[x] Merged to main + DEPLOYED 2026-07-16 (merge ee1754d,
-      parity IN SYNC)** — collection runs in every 6h refresh; backfill ETA
-      ~3-4 weeks. Next: check `esports_dota2_lineups.json` growth in a week.
-- [x] **cs2 collector BUILT + DEPLOYED 2026-07-16** (merge a48c4fc, parity IN
-      SYNC): forward-only bo3.gg lineup collection (the LIST endpoint carries
-      all 10 players/row — no per-match calls) into
+      `load_dota_games()` reader). The 2026-07-18 audit found 39,917 stored
+      matches but only 1,006 lineups (38,911 pending). The old no-new-matches
+      path exhausted calls walking known pages and hit HTTP 429 before lineup
+      capture. Main now stops after two known pages once backfill is complete
+      and captures 450 lineups/run, 4 runs/day, reducing ETA from ~32 to ~22
+      days while staying under OpenDota's 2,000 calls/day.
+- [x] **dota2 historical bootstrap BUILT, RESEARCH ONLY**: published pro-match
+      Parquet has 193,773 raw maps and 191,202 usable merged games with stable
+      player ids. It ends 2024-10-15, leaving a 638-day gap to the then-current
+      forward lineup store. Same-source chronological result: player Elo
+      0.2356 vs team Elo 0.2458 over 23,898 tests. This is promising but is not
+      comparable to production PandaScore's 0.2146 series-level Brier and does
+      not clear the live gate.
+- [x] **cs2 collector BUILT + CANONICALIZED**: forward-only bo3.gg lineup
+      collection (the LIST endpoint carries all 10 players/row — no per-match
+      calls) into
       `esports_cs2_lineups.json`, 30-day age window, tier s-c,
-      `load_cs2_games()` reader. First server run: +453 lineups. Backfill
-      remains impossible (player `team_id` = CURRENT team; verified on a 2020
-      match) so the store grows only forward (~1.5k matches/month). Bonus
-      column noted for later: `six_month_avg_rating` per player — a real
-      skill feature.
-- [ ] **valorant — NO free per-match player source**: vlr mirror has no
-      match-detail endpoint (404), results rows carry no players; PandaScore
-      free tier has none (per-game detail 403) and paid stats plans are
-      betting-restricted. Team endpoint gives current roster only (already
-      used by the guard). Parked until a source appears.
+      `load_cs2_games()` reader. Server audit 2026-07-18: 473 valid matches,
+      4,307 canonical nickname player entries, zero legacy/invalid rows. The
+      collector prunes unresolved legacy rows and recent ones remain eligible
+      for a later refetch.
+- [x] **cs2 historical bootstrap BUILT, NO VERDICT**: the candidate Kaggle
+      HLTV table was rejected because current rosters leak backward into old
+      matches. Replacement `blanchon/cs2_dataset_demo` is replay-grounded and
+      contributes 1,000 exact maps (2026-03-23 through 2026-04-20). Combined
+      audit had 1,472 maps, a 59-day source gap, and only 83 eligible test
+      predictions versus the 100 minimum. Tournament-data usage review is also
+      required before any live use.
+- [x] **valorant free source FOUND, build pending**:
+      `ryanluong1/valorant-champion-tour-2021-2023-data` supplies per-map
+      five-player lineups and stats, MIT licensed, and was current through
+      2026-06-26 when verified. Required safeguards: order chronologically by
+      VLR Match ID because rows have no dates, join score/stat rows on Team IDs
+      because about 7% of names mismatch, account for missing China-hosted
+      stats, and enforce a roughly monthly freshness gate.
 - [ ] Traditional sports (NBA/MLB/tennis...) player data — later; esports
       first (roster churn makes it matter most here).
 

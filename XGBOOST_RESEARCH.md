@@ -117,12 +117,19 @@ positions table already) — so decay is observed, not assumed.
 | 2026-07-13 | Recency weighting (exp 1) | 7 test reads (mlb/nba/fwc: val picked None, no read) | best median delta +0.0008 (lol), worst −0.0019 (valorant) | **DEAD — no gate clears.** Val Briers for None vs 730d were rounding-level ties on the deep-history sports: old data isn't hurting XGB, because elo_exp already carries Elo's sequential recency. Do not re-run on these features. |
 | 2026-07-13 | LoL player-aggregate features (exp 2) | lol (OE per-game universe, 25.9k rows, 1 test read, 5 seeds) | XGB 0.2220 (range .2217-.2223) vs team Elo 0.2359 (**+0.0139**) vs player Elo 0.2263 (**+0.0044**, n=3873) | **FIRST GATE CLEAR — beats team Elo 7x margin AND the player-Elo incumbent 2x margin, every seed positive.** Gain-importance confirms blending: p_gap/p_exp dominate, elo_exp/elo_gap second. NOT deployable as-is: training's team features come from an OE-games engine, live's from the Leaguepedia match engine (train/serve drift) — shipping needs the sidecar extended to carry OE-consistent team+player state, and inherits the OE freshness gate. Held for CLV verdict + explicit user approval per plan. |
 | 2026-07-13 | Esports context features (exp 3: bo_format/tier/fatigue) | dota2 (1 test read), valorant (val-rejected, no read); cs2 test read +0.0006 (68k rows, 100% context) | dota2 +0.0006; valorant val-rejected; cs2 +0.0006 | **DEAD — full negative across all three titles.** Gain importance: elo features ~60x the context features — bo/tier/fatigue carry almost nothing Elo doesn't. Likely cause: store rows are SERIES results, so Bo-variance is partially absorbed into rating dynamics already. Side discovery: the enrichment tripled valorant's store (5.6k->17.4k, to 2021) and its Elo baseline improved (val Brier 0.2325->0.2256) — live-model retune candidate, see MODELS_TODO. |
+| 2026-07-18 | Dota 2 player-history bootstrap | dota2 (191,202 usable merged maps; 23,898 chronological tests) | player Elo 0.2356 vs same-universe team Elo 0.2458 | **PROMISING, RESEARCH ONLY.** The archive ends 2024-10-15 and initially had a 638-day gap to forward data. The comparison is map-level and same-source, not comparable to production PandaScore's 0.2146 series Brier. Wait for current OpenDota lineup coverage and matched production-baseline evaluation. |
+| 2026-07-18 | CS2 replay-history + forward bootstrap | cs2 (1,472 merged maps; 83 eligible tests) | no test verdict | **INSUFFICIENT SAMPLE.** Minimum is 100 eligible tests. The accepted history is replay-grounded; the earlier HLTV-table candidate was rejected after proving backward current-roster leakage. Keep collecting canonical bo3.gg lineups and use recent-source holdout evaluation. |
+| 2026-07-18 | Valorant player-source audit | valorant | dataset integrity audit only; model not run | **VIABLE SOURCE, BUILD PENDING.** Free VCT archive has per-map lineups/stats through June 2026. Chronology must use Match ID, joins must use Team IDs, China-hosted stats are incomplete, and monthly staleness must fail safe. |
 
-## Priority order for Phase 3 (updated by this research)
+## Current player-data priority (updated 2026-07-18)
 
-1. ~~**Recency weighting**~~ — RUN 2026-07-13, DEAD (see ledger). The negative
-   result is itself informative: staleness is already priced into elo_exp, so
-   non-stationarity is not where XGB's headroom is.
-2. **LoL player-aggregate features** — proven-orthogonal signal, data local. NOW NEXT.
-3. **Esports context features** (bo_format/tier/fatigue) — needs store extension
-   + historical re-walk.
+1. **Dota 2** — finish current OpenDota lineup capture, audit the remaining
+   historical gap, then evaluate against matched production predictions.
+2. **CS2** — continue canonical forward collection and rerun after at least
+   100 recent-source holdout predictions are eligible.
+3. **Valorant** — build the Team-ID-based loader and chronological audit, then
+   apply the same player-versus-production evaluation gate.
+4. **LoL** — already live; monitor CLV and win rate rather than retuning.
+
+Recency weighting and esports context remain closed negative experiments. New
+player datasets do not justify rerunning them.
