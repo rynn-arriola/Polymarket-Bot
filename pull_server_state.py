@@ -45,7 +45,8 @@ SNAPSHOTS = MIRROR / "snapshots"
 KEEP_SNAPSHOTS = 30
 
 # Generated on the server, rebuilt every 6h — its copies are always fresher.
-GENERATED = ["elo_ratings.json", "elo_freshness.json", "lol_player_model.json"]
+GENERATED = ["elo_ratings.json", "elo_freshness.json", "lol_player_model.json",
+             "valorant_player_model.json"]
 
 SSH_OPTS = ["-i", SSH_KEY, "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=20"]
 

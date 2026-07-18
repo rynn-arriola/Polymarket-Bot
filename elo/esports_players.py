@@ -1,4 +1,4 @@
-"""Historical player-lineup bootstraps for Dota 2 and CS2.
+"""Historical player-lineup bootstraps for Dota 2, CS2, and Valorant.
 
 The bulk datasets are used only for immutable match facts: date, two teams,
 winner, and player identities. Provider ratings and aggregate statistics are
@@ -11,7 +11,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections import defaultdict
+import csv
+import io
+import zipfile
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -23,11 +26,14 @@ DEFAULT_RATING = 1500.0
 DATA_DIRS = {
     "dota2": Path("data/dota2_pro"),
     "cs2": Path("data/cs2_demo"),
+    "valorant": Path("data/valorant_vct"),
 }
 HISTORICAL_FILES = {
     "dota2": DATA_DIRS["dota2"] / "dota2_matches.parquet",
     "cs2": DATA_DIRS["cs2"] / "manifest.json",
+    "valorant": DATA_DIRS["valorant"] / "vct_2021_2026_kaggle_2026-06-26.zip",
 }
+VALORANT_SOURCE_FILE = DATA_DIRS["valorant"] / "source.json"
 FORWARD_FILES = {
     "dota2": Path("data/cache/esports_dota2_lineups.json"),
     "cs2": Path("data/cache/esports_cs2_lineups.json"),
@@ -52,6 +58,20 @@ def dota_player_key(value) -> str:
     if text.endswith(".0"):
         text = text[:-2]
     return f"dota2:{text}"
+
+
+def valorant_player_key(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text if text.startswith("valorant:") else f"valorant:{text}"
+
+
+def valorant_team_key(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text if text.startswith("valorant-team:") else f"valorant-team:{text}"
 
 
 def _valid_game(game: dict) -> bool:
@@ -225,6 +245,164 @@ def load_cs2_history(path: str | Path = HISTORICAL_FILES["cs2"]) -> list[dict]:
     return games
 
 
+VALORANT_JOIN_COLUMNS = ("Tournament", "Stage", "Match Type", "Match Name", "Map")
+
+
+def _zip_csv_rows(bundle: zipfile.ZipFile, member: str):
+    with bundle.open(member) as raw:
+        with io.TextIOWrapper(raw, encoding="utf-8-sig", newline="") as text:
+            yield from csv.DictReader(text)
+
+
+def _valorant_join_key(row: dict) -> tuple[str, ...]:
+    return tuple(str(row.get(column) or "").strip() for column in VALORANT_JOIN_COLUMNS)
+
+
+def _id_multimap(rows, name_column: str, id_column: str) -> dict[str, set[str]]:
+    result: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        name, identifier = str(row.get(name_column) or "").strip(), str(row.get(id_column) or "").strip()
+        if name and identifier:
+            result[name].add(identifier)
+    return result
+
+
+def _one_id(mapping: dict[str, set[str]], name: str) -> str | None:
+    identifiers = mapping.get(str(name or "").strip(), set())
+    return next(iter(identifiers)) if len(identifiers) == 1 else None
+
+
+def _anchored_orientation(label1: str, label2: str, side_ids: list[str],
+                          team_ids: dict[str, set[str]]) -> int | None:
+    """Return which match side label1 represents, requiring a consistent ID anchor."""
+    first, second = _one_id(team_ids, label1), _one_id(team_ids, label2)
+    candidates = []
+    if first == side_ids[0]:
+        candidates.append(0)
+    if first == side_ids[1]:
+        candidates.append(1)
+    if second == side_ids[0]:
+        candidates.append(1)
+    if second == side_ids[1]:
+        candidates.append(0)
+    return candidates[0] if candidates and len(set(candidates)) == 1 else None
+
+
+def load_valorant_history(path: str | Path = HISTORICAL_FILES["valorant"]) -> list[dict]:
+    """Load exact VCT map lineups using IDs and monotonic VLR Match IDs.
+
+    The archive has no dates, so Match ID is the chronology. Some score and
+    overview rows contain a wrong team display name. Such a row is accepted
+    only when it has two exact five-player groups and at least one team label
+    resolves to a match-side Team ID; the opposite side can then be inferred.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    games, rejected = [], Counter()
+    with zipfile.ZipFile(path) as bundle:
+        years = sorted({match.group(1) for member in bundle.namelist()
+                        if (match := re.match(r"vct_(\d{4})/ids/teams_ids\.csv$", member))})
+        for year in years:
+            prefix = f"vct_{year}"
+            required = [
+                f"{prefix}/ids/teams_ids.csv",
+                f"{prefix}/ids/players_ids.csv",
+                f"{prefix}/ids/tournaments_stages_matches_games_ids.csv",
+                f"{prefix}/matches/maps_scores.csv",
+                f"{prefix}/matches/overview.csv",
+            ]
+            if any(member not in bundle.namelist() for member in required):
+                rejected["missing_year_files"] += 1
+                continue
+            team_ids = _id_multimap(_zip_csv_rows(bundle, required[0]), "Team", "Team ID")
+            player_ids = _id_multimap(_zip_csv_rows(bundle, required[1]), "Player", "Player ID")
+            id_rows = list(_zip_csv_rows(bundle, required[2]))
+            id_key_counts = Counter(_valorant_join_key(row) for row in id_rows)
+            scores: dict[tuple[str, ...], list[dict]] = defaultdict(list)
+            for row in _zip_csv_rows(bundle, required[3]):
+                scores[_valorant_join_key(row)].append(row)
+            roster_groups: dict[tuple[str, ...], dict[str, set[str]]] = defaultdict(
+                lambda: defaultdict(set))
+            for row in _zip_csv_rows(bundle, required[4]):
+                if str(row.get("Side") or "").strip().lower() != "both":
+                    continue
+                player_id = _one_id(player_ids, row.get("Player") or "")
+                if player_id:
+                    roster_groups[_valorant_join_key(row)][
+                        str(row.get("Team") or "").strip()].add(valorant_player_key(player_id))
+                else:
+                    rejected["missing_player_id"] += 1
+
+            for row in id_rows:
+                join_key = _valorant_join_key(row)
+                match_names = [name.strip() for name in str(row.get("Match Name") or "").split(" vs ")]
+                if len(match_names) != 2:
+                    rejected["bad_match_name"] += 1
+                    continue
+                side_ids = [_one_id(team_ids, name) for name in match_names]
+                if not all(side_ids) or side_ids[0] == side_ids[1]:
+                    rejected["bad_team_ids"] += 1
+                    continue
+                if id_key_counts[join_key] != 1:
+                    rejected["ambiguous_match_key"] += 1
+                    continue
+                score_rows = scores.get(join_key, [])
+                if len(score_rows) != 1:
+                    rejected["missing_or_ambiguous_score"] += 1
+                    continue
+                score = score_rows[0]
+                try:
+                    score1, score2 = int(score["Team A Score"]), int(score["Team B Score"])
+                except (KeyError, TypeError, ValueError):
+                    rejected["bad_score"] += 1
+                    continue
+                if score1 == score2:
+                    rejected["tied_score"] += 1
+                    continue
+                score_orientation = _anchored_orientation(
+                    score.get("Team A") or "", score.get("Team B") or "", side_ids, team_ids)
+                groups = roster_groups.get(join_key, {})
+                if len(groups) != 2 or sorted(len(players) for players in groups.values()) != [5, 5]:
+                    rejected["not_exact_5v5"] += 1
+                    continue
+                labels = list(groups)
+                roster_orientation = _anchored_orientation(labels[0], labels[1], side_ids, team_ids)
+                if score_orientation is None or roster_orientation is None:
+                    rejected["unresolved_team_orientation"] += 1
+                    continue
+                lineups = [None, None]
+                lineups[roster_orientation] = sorted(groups[labels[0]])
+                lineups[1 - roster_orientation] = sorted(groups[labels[1]])
+                team_keys = [valorant_team_key(team_id) for team_id in side_ids]
+                score_winner = score_orientation if score1 > score2 else 1 - score_orientation
+                try:
+                    match_id, game_id = int(row["Match ID"]), int(row["Game ID"])
+                except (KeyError, TypeError, ValueError):
+                    rejected["bad_game_id"] += 1
+                    continue
+                game = {
+                    "date": f"vlr-match:{match_id:09d}",
+                    "sequence": match_id,
+                    "teams": {team_keys[0]: lineups[0], team_keys[1]: lineups[1]},
+                    "team_names": {team_keys[0]: match_names[0], team_keys[1]: match_names[1]},
+                    "winner": team_keys[score_winner],
+                    "source": "valorant-vct-kaggle",
+                    "source_id": f"{match_id}:{game_id}",
+                    "sort_key": (match_id, game_id),
+                }
+                if _valid_game(game):
+                    games.append(game)
+                else:
+                    rejected["invalid_game"] += 1
+    games.sort(key=lambda game: game["sort_key"])
+    for game in games:
+        game.pop("sort_key", None)
+    log.info("Valorant bootstrap: %s valid maps from %s; rejected=%s", len(games), path,
+             dict(sorted(rejected.items())))
+    return games
+
+
 def load_forward_games(title: str, path: str | Path | None = None) -> list[dict]:
     path = Path(path) if path else FORWARD_FILES[title]
     try:
@@ -279,13 +457,24 @@ def load_games(title: str) -> list[dict]:
         historical = load_dota_history()
     elif title == "cs2":
         historical = load_cs2_history()
+    elif title == "valorant":
+        return load_valorant_history()
     else:
         raise ValueError(f"unsupported player bootstrap: {title}")
     return merge_games(title, historical, load_forward_games(title))
 
 
 def audit_games(games: list[dict]) -> dict:
-    dates = sorted({game["date"][:10] for game in games if game.get("date")})
+    dates = []
+    for value in {game["date"][:10] for game in games if game.get("date")}:
+        try:
+            datetime.fromisoformat(value)
+            dates.append(value)
+        except ValueError:
+            continue
+    dates.sort()
+    sequences = sorted({int(game["sequence"]) for game in games
+                        if game.get("sequence") is not None})
     largest_gap = 0
     gap_after = None
     for before, after in zip(dates, dates[1:]):
@@ -301,8 +490,24 @@ def audit_games(games: list[dict]) -> dict:
         "latest_date": dates[-1] if dates else None,
         "largest_gap_days": largest_gap,
         "largest_gap_after": gap_after,
+        "earliest_sequence": sequences[0] if sequences else None,
+        "latest_sequence": sequences[-1] if sequences else None,
         "sources": sorted({game.get("source") for game in games if game.get("source")}),
     }
+
+
+def valorant_source_metadata(path: str | Path = VALORANT_SOURCE_FILE,
+                             archive: str | Path = HISTORICAL_FILES["valorant"]) -> dict:
+    """Freshness metadata for an archive whose match rows have no dates."""
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(value, dict) and value.get("last_updated"):
+            datetime.fromisoformat(str(value["last_updated"]).replace("Z", "+00:00"))
+            return value
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        pass
+    match = re.search(r"(20\d{2}-\d{2}-\d{2})", Path(archive).name)
+    return {"last_updated": match.group(1) if match else None, "version": None}
 
 
 def walk_forward(games: list[dict], player_k: float, team_k: float,
@@ -342,12 +547,13 @@ def walk_forward(games: list[dict], player_k: float, team_k: float,
 
 
 def build_model(title: str, player_k: float) -> dict:
-    """Build research state only. No live prediction path reads this model."""
+    """Build the final dual team/player state from a historical game stream."""
     games = load_games(title)
     if not games:
         return {}
     team_k = params.get(title)["k"]
-    ratings, played, team_ratings, team_played, lineups = {}, {}, {}, {}, {}
+    ratings, played, team_ratings, team_played, lineups, team_names = {}, {}, {}, {}, {}, {}
+    name_ids: dict[str, set[str]] = defaultdict(set)
     for game in games:
         (team1, lineup1), (team2, lineup2) = sorted(game["teams"].items())
         player1 = sum(ratings.get(p, DEFAULT_RATING) for p in lineup1) / len(lineup1)
@@ -369,7 +575,25 @@ def build_model(title: str, player_k: float) -> dict:
         team_played[team2] = team_played.get(team2, 0) + 1
         for team, lineup in game["teams"].items():
             lineups[team] = lineup
+        current_names = game.get("team_names") or {}
+        team_names.update(current_names)
+        for team, name in current_names.items():
+            if name:
+                name_ids[name].add(team)
+    audit = audit_games(games)
+    source = valorant_source_metadata() if title == "valorant" else {}
+    team_lookup = {name: next(iter(team_ids)) for name, team_ids in name_ids.items()
+                   if len(team_ids) == 1}
+    latest_date = str(source.get("last_updated") or "")[:10] or audit["latest_date"]
     return {"title": title, "ratings": ratings, "played": played,
             "team_lineups": lineups, "team_elo": team_ratings, "team_games": team_played,
-            "latest_date": games[-1]["date"][:10], "player_k": player_k,
-            "team_k": team_k, "audit": audit_games(games), "eligible_for_live": False}
+            "team_names": team_names, "team_lookup": team_lookup,
+            "latest_date": latest_date, "source_updated_at": source.get("last_updated"),
+            "source_version": source.get("version"),
+            "latest_sequence": audit["latest_sequence"], "player_k": player_k,
+            "team_k": team_k, "audit": audit}
+
+
+def build_valorant_live_model(player_k: float = 32.0) -> dict:
+    """LoL-style live sidecar using VLR IDs and the latest archive lineups."""
+    return build_model("valorant", player_k)

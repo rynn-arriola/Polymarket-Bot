@@ -39,6 +39,15 @@ def main() -> int:
     except Exception as e:
         log.warning(f"fetch_oe skipped: {e}")
 
+    # Valorant player data: check Kaggle's public dataset version each run.
+    # Downloads are atomic and happen only when the version changes; a failed
+    # check leaves the last good archive and sidecar available for fallback.
+    try:
+        import fetch_esports_players
+        fetch_esports_players.fetch_valorant(audit=False)
+    except Exception as e:
+        log.warning(f"fetch_valorant skipped: {e}")
+
     # Rebuild every sport's ratings from cached + freshly-pulled results.
     try:
         import build_ratings

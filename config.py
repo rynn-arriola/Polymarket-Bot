@@ -134,6 +134,11 @@ INJURY_SKIP_STATUSES = ("Out", "Doubtful")
 LOL_PLAYER_ELO = True
 LOL_PLAYER_FRESHNESS_DAYS = 45
 
+# Valorant follows the same player-blend contract as LoL. Its bulk archive
+# has monotonic VLR match IDs but no dates, so freshness uses Kaggle's public
+# dataset `lastUpdated` timestamp. Stale/missing state falls back to team Elo.
+VALORANT_PLAYER_FRESHNESS_DAYS = 45
+
 # --- PandaScore (Valorant source upgrade) ---
 # Valorant's default source is a flaky, scrape-backed vlr.gg mirror with only
 # relative dates and ~13 months of depth. PandaScore's free "Fixtures Only"
