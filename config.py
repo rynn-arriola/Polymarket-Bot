@@ -253,11 +253,11 @@ MAX_STAKE_PCT = 0.02         # hard cap: never risk more than 2% of bankroll on 
 MIN_STAKE = 1.00             # absolute $ floor (whole-contract minimum)
 MAX_OPEN_POSITIONS = 10
 MAX_PER_SPORT_PER_DAY = 5    # correlation cap: max entries per sport per day
-DAILY_LOSS_LIMIT_PCT = 0.015  # halt new entries after losing this % of the day's starting balance.
-                              # Scaled 6%->1.5% on 2026-07-18 alongside STAKE_PCT 1%->0.25% so the
-                              # brake still trips after ~6 full losses; at 6% it would have taken
-                              # ~24 losses at the smaller stakes to halt. Restore to 0.06 together
-                              # with STAKE_PCT = 0.01.
+DAILY_LOSS_LIMIT_PCT = 0.02  # halt new entries after losing this % of the day's starting balance.
+                             # Scaled down from 6% on 2026-07-18 alongside STAKE_PCT 1%->0.25%
+                             # (operator picked 2% over a strict /4=1.5%): brake trips after ~8
+                             # full losses at the smaller stakes — at 6% it would have taken ~24.
+                             # Restore to 0.06 together with STAKE_PCT = 0.01.
 FEE_BUFFER_PCT = 0.005       # cash held back (0.5% of bankroll) so fees can't push an order over balance
 
 # --- Live-order safety ---
