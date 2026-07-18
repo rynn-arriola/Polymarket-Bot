@@ -41,11 +41,23 @@ PITCHER_DEFAULT = 1500.0
 
 _PP_CACHE: tuple[float, dict] | None = None
 _PP_CACHE_TTL = 30 * 60
+_PP_RETRY_AFTER_FAILURE = 2 * 60
 
 
 def probable_pitchers() -> dict[tuple[str, str], int]:
     """{(officialDate, team_name): pitcher_id} for today through +2 days.
-    Empty dict on failure — predictions then fall back to team-only."""
+
+    A FAILED fetch never poisons the cache: the last good answer keeps
+    serving (a 30-min-stale starter beats none — the market has priced the
+    real one, and predicting team-only against it is the adverse-selection
+    trap) and the next attempt comes after _PP_RETRY_AFTER_FAILURE instead
+    of a full TTL. Only a fetch that ANSWERED — even with no starters
+    announced yet, a real pregame state — is cached as truth for the TTL.
+    statsapi.mlb.com serves intermittent 406s (seen 2026-07-16/18), so the
+    failure path is routine, not hypothetical. Serving stale across a long
+    outage is self-limiting: entries are keyed by officialDate, so an old
+    snapshot simply has no keys for later dates and predictions fall back
+    to team-only, same as before."""
     global _PP_CACHE
     now = time.monotonic()
     if _PP_CACHE and now - _PP_CACHE[0] < _PP_CACHE_TTL:
@@ -54,8 +66,18 @@ def probable_pitchers() -> dict[tuple[str, str], int]:
     url = history.MLB_SCHEDULE.format(start=start.isoformat(),
                                       end=(start + timedelta(days=2)).isoformat())
     data = history._get_json(url)
+    if data is None:
+        stale = _PP_CACHE[1] if _PP_CACHE else {}
+        # Backdate the timestamp so the existing freshness check retries
+        # after _PP_RETRY_AFTER_FAILURE seconds, serving stale meanwhile.
+        _PP_CACHE = (now - _PP_CACHE_TTL + _PP_RETRY_AFTER_FAILURE, stale)
+        if stale:
+            log.warning("probable-pitcher fetch failed — serving previous "
+                        f"snapshot ({len(stale)} entries), retrying in "
+                        f"{_PP_RETRY_AFTER_FAILURE // 60} min")
+        return stale
     out: dict[tuple[str, str], int] = {}
-    for d in (data or {}).get("dates", []):
+    for d in data.get("dates", []):
         for g in d.get("games", []):
             for side in ("home", "away"):
                 t = (g.get("teams") or {}).get(side) or {}
