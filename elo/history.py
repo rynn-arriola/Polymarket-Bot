@@ -50,10 +50,19 @@ def _get_json(url: str, timeout: int = 30, headers: dict | None = None) -> dict 
 def cached_chunk(key: str, chunk_end: date, fetch_fn) -> list:
     """Returns fetch_fn()'s result, cached under data/cache/{key}.json.
     Chunks that ended comfortably in the past never refetch; chunks that
-    include recent days refetch at most once per calendar day."""
+    include recent days refetch at most once per calendar day.
+
+    A FAILED refetch serves the stale cache instead of an empty list. The
+    original behavior (return []) silently erased everything the chunk
+    already knew: when statsapi.mlb.com started blocking the droplet's IP
+    (~2026-07-10), the season-sized mlb_2026 chunk came back empty on every
+    6h rebuild and MLB Elo quietly regressed to end-of-2025 ratings for a
+    week — while the freshness guard showed 'fresh', because last_built
+    kept updating. Stale-by-days beats missing-a-season, for every source."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = CACHE_DIR / f"{key}.json"
     today = date.today()
+    cached = None
     if path.exists():
         try:
             with open(path, encoding="utf-8") as f:
@@ -63,9 +72,15 @@ def cached_chunk(key: str, chunk_end: date, fetch_fn) -> list:
             if immutable or fetched_on == today.isoformat():
                 return cached.get("games", [])
         except (json.JSONDecodeError, OSError):
-            pass
+            cached = None
     games = fetch_fn()
     if games is None:
+        if cached is not None:
+            stale_games = cached.get("games", [])
+            log.warning(f"{key}: refetch failed — serving stale cache from "
+                        f"{cached.get('fetched_on') or 'unknown date'} "
+                        f"({len(stale_games)} games)")
+            return stale_games
         return []
     try:
         with open(path, "w", encoding="utf-8") as f:
