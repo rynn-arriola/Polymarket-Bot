@@ -9,76 +9,20 @@ Usage: python exp_esports_players.py valorant --player-k 32
 """
 
 import argparse
-import math
-
 import numpy as np
 import xgboost as xgb
 
 import train_xgb as training
-from elo import esports_players, params
-from elo.engine import EloEngine
+import xgb_features
+from elo import esports_players
 
-FEATURES = ["elo_exp", "elo_gap", "rating_a", "rating_b", "games_a", "games_b",
-            "p_exp", "p_gap", "p_min_gap", "p_spread_diff", "p_experience_diff"]
+FEATURES = xgb_features.PLAYER_FEATURES
 SEEDS = (42, 43, 44, 45, 46)
-MIN_KNOWN = 3
-NAN = float("nan")
 
 
 def extract(games: list[dict], title: str, player_k: float):
-    """Dual walk-forward rows emitted strictly before each map update."""
-    sport_params = params.get(title)
-    team = EloEngine(k_factor=sport_params["k"])
-    ratings: dict[str, float] = {}
-    played: dict[str, int] = {}
-    features, outcomes, chronology = [], [], []
-    for game in games:
-        (team1, lineup1), (team2, lineup2) = sorted(game["teams"].items())
-        if (team.games(team1) >= sport_params["min_games"]
-                and team.games(team2) >= sport_params["min_games"]):
-            row = {
-                "elo_exp": team.probability(team1, team2),
-                "elo_gap": team.get_rating(team1) - team.get_rating(team2),
-                "rating_a": team.get_rating(team1),
-                "rating_b": team.get_rating(team2),
-                "games_a": team.games(team1),
-                "games_b": team.games(team2),
-                "p_exp": NAN,
-                "p_gap": NAN,
-                "p_min_gap": NAN,
-                "p_spread_diff": NAN,
-                "p_experience_diff": NAN,
-            }
-            known1 = [ratings[player] for player in lineup1 if player in ratings]
-            known2 = [ratings[player] for player in lineup2 if player in ratings]
-            if len(known1) >= MIN_KNOWN and len(known2) >= MIN_KNOWN:
-                mean1, mean2 = sum(known1) / len(known1), sum(known2) / len(known2)
-                row["p_exp"] = 1.0 / (1.0 + 10 ** (-(mean1 - mean2) / 400.0))
-                row["p_gap"] = mean1 - mean2
-                row["p_min_gap"] = min(known1) - min(known2)
-                spread = lambda values, mean: math.sqrt(
-                    sum((value - mean) ** 2 for value in values) / len(values))
-                row["p_spread_diff"] = spread(known1, mean1) - spread(known2, mean2)
-                experience1 = sum(played.get(player, 0) for player in lineup1) / len(lineup1)
-                experience2 = sum(played.get(player, 0) for player in lineup2) / len(lineup2)
-                row["p_experience_diff"] = experience1 - experience2
-            features.append(row)
-            outcomes.append(1.0 if game["winner"] == team1 else 0.0)
-            chronology.append(game.get("sequence", game.get("date")))
-
-        actual = 1.0 if game["winner"] == team1 else 0.0
-        team.record_result(team1, team2, actual)
-        rating1 = sum(ratings.get(player, 1500.0) for player in lineup1) / len(lineup1)
-        rating2 = sum(ratings.get(player, 1500.0) for player in lineup2) / len(lineup2)
-        expected = 1.0 / (1.0 + 10 ** ((rating2 - rating1) / 400.0))
-        delta = player_k * (actual - expected)
-        for player in lineup1:
-            ratings[player] = ratings.get(player, 1500.0) + delta
-            played[player] = played.get(player, 0) + 1
-        for player in lineup2:
-            ratings[player] = ratings.get(player, 1500.0) - delta
-            played[player] = played.get(player, 0) + 1
-    return features, outcomes, chronology
+    """Research entry point backed by the production feature extractor."""
+    return xgb_features.extract_esports_players(games, title, player_k)
 
 
 def _brier_column(matrix, outcomes, column):

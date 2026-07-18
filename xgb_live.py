@@ -66,8 +66,10 @@ FWC_FEATURES = ["elo_exp", "elo_gap", "rating_home", "rating_away",
 # state (the lol_player_model.json sidecar), never the live Leaguepedia match
 # engine — mixing the two would be train/serve drift. Player aggregates are
 # NaN when a lineup has <3 rated players (P6: NaN, never 0).
-LOL_FEATURES = ["elo_exp", "elo_gap", "rating_a", "rating_b", "games_a", "games_b",
-                "p_exp", "p_gap", "p_min_gap", "p_spread_diff", "p_experience_diff"]
+PLAYER_FEATURES = ["elo_exp", "elo_gap", "rating_a", "rating_b", "games_a", "games_b",
+                   "p_exp", "p_gap", "p_min_gap", "p_spread_diff",
+                   "p_experience_diff"]
+LOL_FEATURES = PLAYER_FEATURES
 
 # Esports (and any future title-based sport) use the universal base vector —
 # no orthogonal data yet, so this is the honest Elo-only baseline until
@@ -78,7 +80,7 @@ FEATURES_FOR = {"nba": NBA_FEATURES, "wnba": NBA_FEATURES,
                 "atp": TENNIS_FEATURES, "wta": TENNIS_FEATURES,
                 "mlb": MLB_FEATURES, "fwc": FWC_FEATURES,
                 **{t: BASE_FEATURES for t in ESPORTS_TITLES},
-                "lol": LOL_FEATURES}
+                "lol": PLAYER_FEATURES, "valorant": PLAYER_FEATURES}
 
 
 # ------------------------------------------------------------------
@@ -156,15 +158,17 @@ def fwc_features(engine, home: str, away: str) -> dict:
     }
 
 
-LOL_MIN_KNOWN = 3  # <3 rated players per lineup -> player aggregates are NaN
+PLAYER_MIN_KNOWN = 3  # <3 rated players per lineup -> player aggregates are NaN
+LOL_MIN_KNOWN = PLAYER_MIN_KNOWN
 
 
-def lol_features(state: dict, t1: str, t2: str,
-                 lineup1: list[str], lineup2: list[str]) -> dict:
-    """LoL blend feature row for the ALPHABETICALLY-FIRST team t1 vs t2, from
-    OE-consistent state: {'team_elo': {}, 'team_games': {}, 'ratings': {},
-    'played': {}}. Shared by the walk-forward extractor (evolving state) and
-    live inference (the sidecar's final state) — identical either way."""
+def player_features(state: dict, t1: str, t2: str,
+                    lineup1: list[str], lineup2: list[str]) -> dict:
+    """Player-blend row for alphabetically ordered stable team keys.
+
+    State contains team Elo/games plus player ratings/games. The walk-forward
+    extractor and live sidecars call this exact builder.
+    """
     import math
     nan = float("nan")
     te, tg = state.get("team_elo", {}), state.get("team_games", {})
@@ -180,7 +184,7 @@ def lol_features(state: dict, t1: str, t2: str,
     }
     k1 = [ratings[x] for x in lineup1 if x in ratings]
     k2 = [ratings[x] for x in lineup2 if x in ratings]
-    if len(k1) >= LOL_MIN_KNOWN and len(k2) >= LOL_MIN_KNOWN:
+    if len(k1) >= PLAYER_MIN_KNOWN and len(k2) >= PLAYER_MIN_KNOWN:
         m1, m2 = sum(k1) / len(k1), sum(k2) / len(k2)
         sd = lambda v, m: math.sqrt(sum((x - m) ** 2 for x in v) / len(v))
         row["p_exp"] = 1.0 / (1.0 + 10 ** (-(m1 - m2) / 400.0))
@@ -193,8 +197,16 @@ def lol_features(state: dict, t1: str, t2: str,
     return row
 
 
+def lol_features(state: dict, t1: str, t2: str,
+                 lineup1: list[str], lineup2: list[str]) -> dict:
+    """Compatibility wrapper for the original LoL feature contract."""
+    return player_features(state, t1, t2, lineup1, lineup2)
+
+
 _LOL_SIDECAR: dict | None = None
 _LOL_SIDECAR_LOADED = False
+_VALORANT_SIDECAR: dict | None = None
+_VALORANT_SIDECAR_LOADED = False
 
 
 def reset_lol_sidecar():
@@ -230,6 +242,60 @@ def _lol_sidecar() -> dict | None:
         return None  # stale lineups — the player-Elo path logs this already
     _LOL_SIDECAR = model
     return model
+
+
+def reset_valorant_sidecar():
+    """Re-read valorant_player_model.json on next use."""
+    global _VALORANT_SIDECAR, _VALORANT_SIDECAR_LOADED
+    _VALORANT_SIDECAR, _VALORANT_SIDECAR_LOADED = None, False
+
+
+def _valorant_sidecar() -> dict | None:
+    """Return fresh, complete VCT state; otherwise signal team-Elo fallback."""
+    global _VALORANT_SIDECAR, _VALORANT_SIDECAR_LOADED
+    if _VALORANT_SIDECAR_LOADED:
+        return _VALORANT_SIDECAR
+    _VALORANT_SIDECAR_LOADED = True
+    try:
+        with open("valorant_player_model.json") as handle:
+            model = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    dict_fields = ("ratings", "played", "team_elo", "team_games",
+                   "team_lineups", "team_lookup")
+    if any(not isinstance(model.get(key), dict) for key in dict_fields):
+        return None
+    if not model["team_elo"] or not model["team_lineups"] or not model["team_lookup"]:
+        return None
+    try:
+        age_days = (date.today()
+                    - date.fromisoformat(str(model.get("latest_date", ""))[:10])).days
+    except (TypeError, ValueError):
+        return None
+    if age_days < 0 or age_days > getattr(config, "VALORANT_PLAYER_FRESHNESS_DAYS", 45):
+        return None
+    _VALORANT_SIDECAR = model
+    return model
+
+
+def _valorant_live_features(name_a: str, name_b: str) -> tuple[dict, bool] | None:
+    """Resolve display names to stable VLR team IDs and build one live row."""
+    import name_match
+    sidecar = _valorant_sidecar()
+    if not sidecar:
+        return None
+    lookup = sidecar["team_lookup"]
+    resolved_a = name_match.resolve(name_a, lookup.keys())
+    resolved_b = name_match.resolve(name_b, lookup.keys())
+    if not resolved_a or not resolved_b:
+        return None
+    team_a, team_b = lookup[resolved_a], lookup[resolved_b]
+    lineups = sidecar["team_lineups"]
+    if team_a == team_b or team_a not in lineups or team_b not in lineups:
+        return None
+    first, second = sorted((team_a, team_b))
+    row = player_features(sidecar, first, second, lineups[first], lineups[second])
+    return row, first != team_a
 
 
 def basketball_features(engine, league: str, home: str, away: str, game_date: str) -> dict:
@@ -283,6 +349,7 @@ def reset_cache():
     sidecar — the refresh rebuilds it on the same cadence."""
     _CACHE.clear()
     reset_lol_sidecar()
+    reset_valorant_sidecar()
 
 
 def load_model(sport: str):
@@ -381,6 +448,11 @@ def predict(sport: str, engine, name_a: str, name_b: str, ctx: dict) -> float | 
         a, b = sorted((ra, rb))
         feats = lol_features(sc, a, b, lineups[a], lineups[b])
         flip = a != ra  # model gives P(alphabetical-first); flip to name_a's team
+    elif sport == "valorant":
+        built = _valorant_live_features(name_a, name_b)
+        if not built:
+            return None
+        feats, flip = built
     elif sport in ESPORTS_TITLES:
         a, b = sorted((name_a, name_b))
         feats = base_features(engine, a, b)

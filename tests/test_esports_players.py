@@ -14,6 +14,7 @@ try:
 except ImportError:
     pa = pq = None
 
+import fetch_esports_players
 from elo import esports, esports_players
 
 
@@ -222,10 +223,65 @@ class ForwardLoaderTests(unittest.TestCase):
                   "teams": {"valorant-team:1": ["valorant:1", "valorant:2", "valorant:3"],
                             "valorant-team:2": ["valorant:4", "valorant:5", "valorant:6"]},
                   "winner": "valorant-team:1", "source": "valorant-vct-kaggle"}]
-        with patch.object(esports_players, "load_games", return_value=games):
+        source = {"last_updated": "2026-06-26T06:01:26.74Z", "version": 47}
+        with (patch.object(esports_players, "load_games", return_value=games),
+              patch.object(esports_players, "valorant_source_metadata", return_value=source)):
             model = esports_players.build_model("valorant", 32.0)
-        self.assertIsNone(model["latest_date"])
+        self.assertEqual("2026-06-26", model["latest_date"])
+        self.assertEqual(47, model["source_version"])
         self.assertEqual(100, model["latest_sequence"])
+
+    def test_valorant_model_uses_latest_lineup_and_unique_display_names(self):
+        games = []
+        for sequence, lineup in ((1, ["valorant:1", "valorant:2", "valorant:3"]),
+                                 (2, ["valorant:1", "valorant:2", "valorant:4"])):
+            games.append({
+                "date": f"vlr-match:{sequence:09d}", "sequence": sequence,
+                "teams": {"valorant-team:1": lineup,
+                          "valorant-team:2": ["valorant:6", "valorant:7", "valorant:8"]},
+                "team_names": {"valorant-team:1": "Shared",
+                               "valorant-team:2": "Shared"},
+                "winner": "valorant-team:1", "source": "valorant-vct-kaggle",
+            })
+        with (patch.object(esports_players, "load_games", return_value=games),
+              patch.object(esports_players, "valorant_source_metadata",
+                           return_value={"last_updated": "2026-06-26", "version": 47})):
+            model = esports_players.build_valorant_live_model()
+        self.assertEqual(["valorant:1", "valorant:2", "valorant:4"],
+                         model["team_lineups"]["valorant-team:1"])
+        self.assertEqual({}, model["team_lookup"])
+
+    def test_valorant_model_keeps_unambiguous_historical_alias(self):
+        games = []
+        for sequence, name in ((1, "Old Alpha"), (2, "Alpha")):
+            games.append({
+                "date": f"vlr-match:{sequence:09d}", "sequence": sequence,
+                "teams": {"valorant-team:1": ["valorant:1", "valorant:2", "valorant:3"],
+                          "valorant-team:2": ["valorant:6", "valorant:7", "valorant:8"]},
+                "team_names": {"valorant-team:1": name, "valorant-team:2": "Bravo"},
+                "winner": "valorant-team:1", "source": "valorant-vct-kaggle",
+            })
+        with (patch.object(esports_players, "load_games", return_value=games),
+              patch.object(esports_players, "valorant_source_metadata",
+                           return_value={"last_updated": "2026-06-26", "version": 47})):
+            model = esports_players.build_valorant_live_model()
+        self.assertEqual("Alpha", model["team_names"]["valorant-team:1"])
+        self.assertEqual("valorant-team:1", model["team_lookup"]["Old Alpha"])
+
+    def test_valorant_fetch_downloads_when_unmanifested_archive_is_older(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            archive = directory / fetch_esports_players.DATASETS["valorant"]["archive"]
+            archive.write_bytes(b"old")
+            metadata = {"last_updated": "2026-07-15T00:00:00Z", "version": 48}
+            with (patch.dict(esports_players.DATA_DIRS, {"valorant": directory}),
+                  patch.object(fetch_esports_players, "_valorant_metadata",
+                               return_value=metadata),
+                  patch.object(fetch_esports_players, "_download") as download):
+                fetch_esports_players.fetch_valorant(audit=False)
+            download.assert_called_once()
+            manifest = json.loads((directory / "source.json").read_text(encoding="utf-8"))
+            self.assertEqual(48, manifest["version"])
 
 
 if __name__ == "__main__":
