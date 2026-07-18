@@ -436,7 +436,7 @@ pattern applied to the sports where roster churn hurts most:
 | LoL | Oracle's Elixir CSVs | **have it** — powers the live blend |
 | Dota 2 | OpenDota per-match lineups | **collector live in the 6h refresh** — ~18-month backfill completes in ~3–4 weeks; a player model becomes trainable (on xgboost-dev, activated only via the usual XGB gates) once the store is deep |
 | CS2 | bo3.gg per-match players | **forward-only collector live in the 6h refresh (since 2026-07-16)** — players carry only their *current* team, so history can't be side-split: the store grows only from deploy day (~1.5k tier s–c matches/month) |
-| Valorant | none | probed 2026-07-16: no free per-match source; PandaScore's paid stats plans are restricted to non-betting usage |
+| Valorant | Kaggle VCT dataset (found 2026-07-18) | **viable, not yet built.** `ryanluong1/valorant-champion-tour-2021-2023-data` (title says 2021–2026): per-map 5-player lineups + rich stats, MIT, ~monthly updates (last 2026-06-26), anonymously downloadable — the Oracle's-Elixir pattern, zero scraping by us. Verified 2026-07-18 on the real archive. Caveats for the eventual build: **no dates** (order by Match ID — vlr assigns them ~chronologically), ~7% of scores rows have team-name/Match-Name mismatches (**join on Team IDs**, as the author warns), China-hosted matches missing stats, and updates lag up to ~a month (needs an OE-style staleness gate). Build waits until the Dota/CS2 collectors prove the player-model pattern. The 07-16 "no free per-match source" conclusion was true for APIs but missed published datasets. |
 
 ### Name matching — the highest-maintenance part of the system
 
