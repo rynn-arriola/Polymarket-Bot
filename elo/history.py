@@ -160,6 +160,91 @@ def mlb_season(year: int) -> list[dict]:
     return cached_chunk(f"mlb_{year}", season_end, fetch)
 
 
+# ------------------------------------------------------------------
+# MLB via ESPN (the CURRENT source, since 2026-07-18) — statsapi.mlb.com
+# blocks the droplet's IP at the origin (406, all header variants, since
+# ~2026-07-10), so results + probable starters now come from the same ESPN
+# scoreboard family that already powers NBA/WNBA/WTA/FWC. Pitcher IDs are
+# ESPN athlete ids — a different id space from statsapi, consistent across
+# history and live probables, which is all the model needs. The statsapi
+# fetchers above are kept for reference / in case the block ever lifts;
+# nothing calls them.
+# ------------------------------------------------------------------
+
+ESPN_MLB_PATH = "baseball/mlb"
+# season.type: 1 = spring training (excluded — different rosters/effort),
+# 2 = regular, 3 = postseason. The All-Star game arrives as type 2, so the
+# real-teams whitelist (same trick as NBA exhibitions) is what excludes it.
+ESPN_MLB_SEASON_TYPES = {2, 3}
+
+
+def _parse_espn_mlb_events(data: dict, real_teams: set[str] | None) -> list[dict]:
+    """Finished MLB games in the shape replay() expects:
+    {date, home, away, hs, as_, home_pitcher, away_pitcher} — pitcher ids
+    are ESPN athlete ids (str) or None when ESPN lists no probable."""
+    out = []
+    for ev in (data or {}).get("events", []):
+        if (ev.get("season") or {}).get("type") not in ESPN_MLB_SEASON_TYPES:
+            continue
+        comps = ev.get("competitions") or []
+        if not comps:
+            continue
+        c = comps[0]
+        if not ((c.get("status") or {}).get("type") or {}).get("completed"):
+            continue
+        by_side = {}
+        for comp in c.get("competitors") or []:
+            name = (comp.get("team") or {}).get("displayName")
+            score = comp.get("score")
+            side = comp.get("homeAway")
+            if name is None or score is None or side not in ("home", "away"):
+                continue
+            # Era-accurate names must be unified BEFORE the whitelist check:
+            # ESPN says "Oakland Athletics" on 2022-24 games and "Athletics"
+            # from 2025 — without the alias the whitelist (current names)
+            # silently drops every pre-move A's game (162/season).
+            name = MLB_NAME_ALIASES.get(name, name)
+            pid = None
+            probables = comp.get("probables") or []
+            if probables:
+                pid = ((probables[0].get("athlete") or {}).get("id"))
+            try:
+                by_side[side] = (name, int(float(score)), str(pid) if pid else None)
+            except (TypeError, ValueError):
+                continue
+        if "home" not in by_side or "away" not in by_side:
+            continue
+        h, a = by_side["home"], by_side["away"]
+        if real_teams and (h[0] not in real_teams or a[0] not in real_teams):
+            continue  # All-Star squads, exhibitions
+        out.append({"date": (c.get("date") or ev.get("date") or "")[:10],
+                    "home": h[0], "away": a[0], "hs": h[1], "as_": a[1],
+                    "home_pitcher": h[2], "away_pitcher": a[2]})
+    return out
+
+
+def espn_mlb_games(start: date, end: date, sleep_sec: float = 0.1) -> list[dict]:
+    """Every finished real MLB game in [start, end] from ESPN, chronological,
+    with probable-starter ids. Month-chunked and cached like every other
+    ESPN sport; a failed refetch serves the stale chunk (see cached_chunk)."""
+    real_teams = espn_real_teams(ESPN_MLB_PATH)
+    games = []
+    for c_start, c_end in _month_chunks(start, min(end, date.today())):
+        def fetch(c_start=c_start, c_end=c_end):
+            url = ESPN_SCOREBOARD.format(path=ESPN_MLB_PATH,
+                                         d1=c_start.strftime("%Y%m%d"),
+                                         d2=c_end.strftime("%Y%m%d"), limit=ESPN_LIMIT)
+            data = _get_json(url)
+            if data is None:
+                return None
+            if sleep_sec:
+                time.sleep(sleep_sec)
+            return _parse_espn_mlb_events(data, real_teams)
+        games.extend(cached_chunk(f"mlb_espn_{c_start.strftime('%Y%m')}", c_end, fetch))
+    games.sort(key=lambda g: g["date"])
+    return games
+
+
 MLB_PITCHING = ("https://statsapi.mlb.com/api/v1/stats?stats=season&group=pitching"
                 "&season={year}&sportId=1&limit=1100")
 
