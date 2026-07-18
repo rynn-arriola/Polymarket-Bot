@@ -27,7 +27,8 @@ APPLY = "--apply" in sys.argv
 
 def main():
     db_init()
-    auth = PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY)
+    import api_guard
+    auth = api_guard.governed(PolymarketUS(key_id=config.KEY_ID, secret_key=config.SECRET_KEY))
     rows = db("SELECT id, market_slug, status, pnl FROM manual_trades "
               "WHERE live=1 AND status='cashed_out'", fetch=True)
     print(f"{len(rows)} cashed_out manual row(s) to re-sync "
