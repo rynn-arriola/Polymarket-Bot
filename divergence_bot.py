@@ -1369,8 +1369,10 @@ def mark_rescheduled_positions(pub) -> int:
     the normal MAX_OPEN_POSITIONS budget.
 
     `game_start` is updated to the exchange's new start so closing-line capture
-    still runs near the actual game. `original_game_start` preserves the first
-    start we bought against. Fail-open everywhere: lookup/update failure ->
+    still runs near the actual game, and any close already captured against the
+    abandoned start is cleared (same as paper signals) — otherwise a bot outage
+    over the new window would leave a stale, wrong close in CLV. `original_game_start`
+    preserves the first start we bought against. Fail-open everywhere: lookup/update failure ->
     retry next cycle. Positions whose rescheduled market carries NO date yet
     (TBD) are left alone until the exchange sets one. Dry-run positions are
     skipped (nothing real to protect from fees)."""
@@ -1406,7 +1408,9 @@ def mark_rescheduled_positions(pub) -> int:
               SET original_game_start=COALESCE(original_game_start, game_start),
                   game_start=?,
                   rescheduled_start=?,
-                  rescheduled_at=?
+                  rescheduled_at=?,
+                  closing_price=NULL,
+                  closing_captured_at=NULL
               WHERE id=?""",
            (new_start_iso, new_start_iso, now.isoformat(), pid))
         marked += 1
@@ -1437,9 +1441,11 @@ def capture_closing_lines(pub):
     Inside the final CLOSING_CAPTURE_MINUTES we re-snapshot every cycle, so
     the last value before start is the true closing line; if we only observed
     the position after start and never captured, we grab one post-start price
-    as a fallback. Priced per side (is_long) so CLV compares like with like."""
+    as a fallback (CLOSING_FALLBACK_MINUTES — sized to outlast a ban cooldown).
+    Priced per side (is_long) so CLV compares like with like."""
     now = datetime.now(timezone.utc)
     window = timedelta(minutes=getattr(config, "CLOSING_CAPTURE_MINUTES", 5))
+    late = timedelta(minutes=getattr(config, "CLOSING_FALLBACK_MINUTES", 60))
     rows = db(
         "SELECT id, market_slug, game_start, is_long, closing_price FROM positions "
         "WHERE status IN ('pending','open') AND game_start IS NOT NULL",
@@ -1451,7 +1457,7 @@ def capture_closing_lines(pub):
         except (TypeError, ValueError):
             continue
         in_window = start - window <= now <= start
-        fallback = existing is None and start < now <= start + timedelta(minutes=30)
+        fallback = existing is None and start < now <= start + late
         if not (in_window or fallback):
             continue
         mid = _market_mid(pub, slug, bool(is_long))
@@ -1467,6 +1473,7 @@ def capture_signal_closing_lines(pub):
         return
     now = datetime.now(timezone.utc)
     window = timedelta(minutes=getattr(config, "CLOSING_CAPTURE_MINUTES", 5))
+    late = timedelta(minutes=getattr(config, "CLOSING_FALLBACK_MINUTES", 60))
     rows = db(
         """SELECT id, market_slug, game_start, is_long, closing_price
            FROM shadow_signals WHERE status='open' AND game_start IS NOT NULL""",
@@ -1477,7 +1484,7 @@ def capture_signal_closing_lines(pub):
         if start is None:
             continue
         in_window = start - window <= now <= start
-        fallback = existing is None and start < now <= start + timedelta(minutes=30)
+        fallback = existing is None and start < now <= start + late
         if not (in_window or fallback):
             continue
         mid = _market_mid(pub, slug, bool(is_long))

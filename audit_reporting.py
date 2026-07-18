@@ -15,6 +15,7 @@ Checks:
 
 import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 
 import config
 
@@ -82,6 +83,62 @@ for slug, pnl, settled in rows:
     print(f"  {slug}: pnl={pnl} (estimate) settled {str(settled)[:16]}")
 if not rows:
     print("  none — all settled pnl is exchange-reconciled")
+
+# CLV coverage: a filled trade (or paper signal) whose game started past every
+# capture chance — pre-start window plus CLOSING_FALLBACK_MINUTES — and still
+# has no close is silently absent from every CLV figure. Recent ones are
+# flagged (capture is broken or the bot was down through the whole window);
+# older ones are informational — they cannot be captured retroactively and
+# must not make every future audit non-CLEAN (the 2026-07-13/14 downtime left
+# 10 such rows).
+CLV_GRACE_MIN = getattr(config, "CLOSING_FALLBACK_MINUTES", 60) + 10
+CLV_RECENT_HOURS = 48
+_now = datetime.now(timezone.utc)
+_clv_cutoff = (_now - timedelta(minutes=CLV_GRACE_MIN)).isoformat()
+
+
+def _clv_recent(gstart) -> bool:
+    try:
+        return datetime.fromisoformat(str(gstart)) >= _now - timedelta(hours=CLV_RECENT_HOURS)
+    except ValueError:
+        return True  # unparseable start: surface it rather than bury it
+
+section("A9. CLV capture coverage — filled positions missing a closing line")
+rows = q("""SELECT market_slug, status, game_start FROM positions
+            WHERE live=1 AND status IN ('open','won','lost','push')
+            AND game_start IS NOT NULL AND datetime(game_start) <= datetime(?)
+            AND closing_price IS NULL ORDER BY game_start""", _clv_cutoff)
+old_n = 0
+for slug, status, gstart in rows:
+    if _clv_recent(gstart):
+        flag(f"{slug}: {status}, game started {str(gstart)[:16]}, no close captured "
+             f"(capture missed its whole window — was the bot down/banned?)")
+    else:
+        old_n += 1
+if old_n:
+    print(f"  ({old_n} older uncaptured trade(s) — historical, not retro-capturable, not flagged)")
+if not rows:
+    print("  none — every filled trade past its capture window has a close")
+
+section("A10. CLV capture coverage — paper signals missing a closing line")
+try:
+    rows = q("""SELECT market_slug, status, game_start FROM shadow_signals
+                WHERE live=1 AND game_start IS NOT NULL
+                AND datetime(game_start) <= datetime(?)
+                AND closing_price IS NULL ORDER BY game_start""", _clv_cutoff)
+except sqlite3.OperationalError:
+    rows = []
+    print("  (no shadow_signals table — older DB)")
+old_n = 0
+for slug, status, gstart in rows:
+    if _clv_recent(gstart):
+        flag(f"{slug}: paper {status}, game started {str(gstart)[:16]}, no close captured")
+    else:
+        old_n += 1
+if old_n:
+    print(f"  ({old_n} older uncaptured signal(s) — historical, not flagged)")
+if not rows:
+    print("  none — every recorded signal past its capture window has a close")
 
 # ------------------------------------------------------- B. exchange truth
 section("B. Exchange resolutions vs DB (last 50)")

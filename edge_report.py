@@ -14,7 +14,7 @@ each slice's own break-even (avg entry price + fees), then P&L.
 """
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import config
 
@@ -47,6 +47,10 @@ def thin(n, need=MIN_N):
 
 
 SETTLED = "status IN ('won','lost','push')"
+# CLV counts FILLED trades only. A cancelled row's captured close belongs to
+# an order that never filled — usually BECAUSE the price ran away from it, so
+# including it systematically flatters CLV with money never at risk.
+CLV_FILLED = "status IN ('open','won','lost','push')"
 
 print("=" * 74)
 print(f"EDGE REPORT | {'LIVE' if LIVE else 'DRY-RUN'} | generated {datetime.now(timezone.utc).isoformat()[:16]}Z")
@@ -62,13 +66,30 @@ n, w, l, p, pnl, staked = one(f"""
 clv, beat, clv_n = one(f"""
     SELECT AVG(closing_price - market_price),
            AVG(closing_price > market_price), COUNT(*)
-    FROM positions WHERE live={LIVE} AND closing_price IS NOT NULL AND market_price IS NOT NULL""")
+    FROM positions WHERE live={LIVE} AND {CLV_FILLED}
+    AND closing_price IS NOT NULL AND market_price IS NOT NULL""")
 open_n = one(f"SELECT COUNT(*) FROM positions WHERE live={LIVE} AND status IN ('open','pending')")[0]
 
 print(f"\nOVERALL: {n} settled ({w}W-{l}L-{p}P, {open_n} open)")
 print(f"  P&L {pnl:+.2f} on ${staked:.0f} staked  ->  yield {pnl/staked:+.1%}" if staked else "  no settled stakes yet")
 print(f"  CLV {fmt_pct(clv)} avg | beat close {beat:.0%} of {clv_n}{thin(clv_n, MIN_CLV_N)}"
       if clv_n else "  CLV: none captured yet")
+
+# Capture coverage: filled trades past every capture chance (pre-start window
+# + post-start fallback) that still miss a close are absent from EVERY CLV
+# figure in this report — say so up front rather than let the subset pass as
+# the whole.
+_grace = getattr(config, "CLOSING_FALLBACK_MINUTES", 60) + 10
+_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=_grace)).isoformat()
+cap, elig = one(f"""
+    SELECT COALESCE(SUM(closing_price IS NOT NULL),0), COUNT(*)
+    FROM positions WHERE live={LIVE} AND {CLV_FILLED}
+    AND game_start IS NOT NULL AND datetime(game_start) <= datetime(?)""", _cutoff)
+if elig and cap < elig:
+    print(f"  CLV capture coverage: {cap}/{elig} — {elig - cap} filled trade(s) MISSING a close; "
+          f"every CLV figure below is computed on the captured subset only")
+elif elig:
+    print(f"  CLV capture coverage: {cap}/{elig} — complete")
 
 # --------------------------------------------------------------- by sport
 print(f"\nBY SPORT{'':<24}(sorted by settled n; CLV is the early signal)")
@@ -79,7 +100,8 @@ rows = q(f"""
     FROM positions WHERE live={LIVE} AND {SETTLED} GROUP BY sport ORDER BY COUNT(*) DESC""")
 for sport, sn, sw, sl, spnl, sstk in rows:
     sclv, sclv_n = one(f"""SELECT AVG(closing_price - market_price), COUNT(*) FROM positions
-                           WHERE live={LIVE} AND sport=? AND closing_price IS NOT NULL
+                           WHERE live={LIVE} AND {CLV_FILLED} AND sport=?
+                           AND closing_price IS NOT NULL
                            AND market_price IS NOT NULL""", sport)
     wr = sw / (sw + sl) if (sw + sl) else None
     yld = spnl / sstk if sstk else None
@@ -96,7 +118,7 @@ for lo, hi in ((0.05, 0.10), (0.10, 0.15), (0.15, 0.21)):
         FROM positions WHERE live={LIVE} AND {SETTLED} AND divergence >= ? AND divergence < ?""",
         lo, hi)
     bclv = one(f"""SELECT AVG(closing_price - market_price) FROM positions
-                   WHERE live={LIVE} AND divergence >= ? AND divergence < ?
+                   WHERE live={LIVE} AND {CLV_FILLED} AND divergence >= ? AND divergence < ?
                    AND closing_price IS NOT NULL AND market_price IS NOT NULL""", lo, hi)[0]
     wr = bw / (bw + bl) if (bw or 0) + (bl or 0) else None
     model = f"{bmodel:.0%}" if bmodel is not None else "--"
@@ -131,7 +153,8 @@ for label, cond in (("long", "is_long=1 OR is_long IS NULL"), ("short", "is_long
     if not sn:
         continue
     sclv = one(f"""SELECT AVG(closing_price - market_price) FROM positions
-                   WHERE live={LIVE} AND ({cond}) AND closing_price IS NOT NULL
+                   WHERE live={LIVE} AND {CLV_FILLED} AND ({cond})
+                   AND closing_price IS NOT NULL
                    AND market_price IS NOT NULL""")[0]
     wr = sw / (sw + sl) if (sw or 0) + (sl or 0) else None
     avgp = f"{sprice:.2f}" if sprice is not None else "--"
@@ -162,7 +185,8 @@ if clv_n and clv_n >= MIN_CLV_N:
 
 for sport, sn, sw, sl, spnl, sstk in rows:
     sclv, sclv_n = one(f"""SELECT AVG(closing_price - market_price), COUNT(*) FROM positions
-                           WHERE live={LIVE} AND sport=? AND closing_price IS NOT NULL
+                           WHERE live={LIVE} AND {CLV_FILLED} AND sport=?
+                           AND closing_price IS NOT NULL
                            AND market_price IS NOT NULL""", sport)
     if (sclv_n or 0) >= MIN_CLV_N and (sclv or 0) <= -0.01:
         recs.append(f"{sport}: CLV {sclv:+.1%} over {sclv_n} — PAUSE CANDIDATE "
@@ -186,7 +210,8 @@ for label, cond in (("long", "is_long=1 OR is_long IS NULL"), ("short", "is_long
     sn, spnl = one(f"SELECT COUNT(*), COALESCE(SUM(pnl),0) FROM positions "
                    f"WHERE live={LIVE} AND {SETTLED} AND ({cond})")
     sclv, sclv_n = one(f"""SELECT AVG(closing_price - market_price), COUNT(*) FROM positions
-                           WHERE live={LIVE} AND ({cond}) AND closing_price IS NOT NULL
+                           WHERE live={LIVE} AND {CLV_FILLED} AND ({cond})
+                           AND closing_price IS NOT NULL
                            AND market_price IS NOT NULL""")
     if sn >= MIN_N and spnl < 0 and (sclv_n or 0) >= MIN_CLV_N and (sclv or 0) < -0.01:
         recs.append(f"{label} side: P&L {spnl:+.2f} (n={sn}) AND CLV {sclv:+.1%} — "
