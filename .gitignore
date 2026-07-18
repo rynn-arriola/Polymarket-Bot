@@ -27,3 +27,8 @@ server_mirror/
 xgb_models/*
 !xgb_models/lol.meta.json
 !xgb_models/lol.ubj
+!xgb_models/valorant.meta.json
+!xgb_models/valorant.ubj
+
+# Player sidecars are rebuilt from source data on the server.
+valorant_player_model.json

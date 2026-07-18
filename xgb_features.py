@@ -20,6 +20,7 @@ BASE_FEATURES = xgb_live.BASE_FEATURES
 MLB_FEATURES = xgb_live.MLB_FEATURES
 FWC_FEATURES = xgb_live.FWC_FEATURES
 LOL_FEATURES = xgb_live.LOL_FEATURES
+PLAYER_FEATURES = xgb_live.PLAYER_FEATURES
 
 
 def extract_nba(games: list[dict], league: str = "nba", season_regress: float = 1 / 3):
@@ -78,16 +79,14 @@ def extract_fwc(games: list[dict]):
             [d for (_f, d), _ in preds])
 
 
-def extract_lol_players(games: list[dict]):
-    """LoL blend (predicts P(alphabetically-first team wins)): dual
-    walk-forward — team Elo AND player ratings over the SAME OE game stream
-    — emitting the shared lol_features row strictly pre-game. Mirrors the
-    sidecar build (lol_players.build_live_model) update-for-update so the
-    state a live prediction reads is exactly what training saw."""
-    from elo import lol_players
-    team_k = 72.0    # matches params 'lol' k and the sidecar's team engine
-    player_k = 48.0  # backtest-winning player K (lol_players)
-    min_team_games = params.get("lol")["min_games"]
+def extract_esports_players(games: list[dict], title: str, player_k: float):
+    """Player blend for one ordered game stream, emitted strictly pre-game.
+
+    The evolving state and the final live sidecar use identical updates, and
+    both call xgb_live.player_features so training and serving cannot drift.
+    """
+    team_k = params.get(title)["k"]
+    min_team_games = params.get(title)["min_games"]
     state = {"team_elo": {}, "team_games": {}, "ratings": {}, "played": {}}
     te, tg, ratings, played = (state["team_elo"], state["team_games"],
                                state["ratings"], state["played"])
@@ -95,9 +94,9 @@ def extract_lol_players(games: list[dict]):
     for g in games:
         (t1, p1), (t2, p2) = sorted(g["teams"].items())
         if tg.get(t1, 0) >= min_team_games and tg.get(t2, 0) >= min_team_games:
-            X.append(xgb_live.lol_features(state, t1, t2, p1, p2))
+            X.append(xgb_live.player_features(state, t1, t2, p1, p2))
             y.append(1 if g["winner"] == t1 else 0)
-            dates.append(g["date"])
+            dates.append(g.get("sequence", g.get("date", "")))
         actual1 = 1.0 if g["winner"] == t1 else 0.0
         r1, r2 = te.get(t1, 1500.0), te.get(t2, 1500.0)
         exp1 = 1.0 / (1.0 + 10 ** ((r2 - r1) / 400.0))
@@ -116,6 +115,11 @@ def extract_lol_players(games: list[dict]):
             ratings[x] = ratings.get(x, 1500.0) - pdelta
             played[x] = played.get(x, 0) + 1
     return X, y, dates
+
+
+def extract_lol_players(games: list[dict]):
+    """LoL compatibility entry point for the shared player extractor."""
+    return extract_esports_players(games, "lol", 48.0)
 
 
 def extract_esports(matches: list[tuple[str, str, str]], title: str):

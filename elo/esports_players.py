@@ -33,6 +33,7 @@ HISTORICAL_FILES = {
     "cs2": DATA_DIRS["cs2"] / "manifest.json",
     "valorant": DATA_DIRS["valorant"] / "vct_2021_2026_kaggle_2026-06-26.zip",
 }
+VALORANT_SOURCE_FILE = DATA_DIRS["valorant"] / "source.json"
 FORWARD_FILES = {
     "dota2": Path("data/cache/esports_dota2_lineups.json"),
     "cs2": Path("data/cache/esports_cs2_lineups.json"),
@@ -495,6 +496,20 @@ def audit_games(games: list[dict]) -> dict:
     }
 
 
+def valorant_source_metadata(path: str | Path = VALORANT_SOURCE_FILE,
+                             archive: str | Path = HISTORICAL_FILES["valorant"]) -> dict:
+    """Freshness metadata for an archive whose match rows have no dates."""
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(value, dict) and value.get("last_updated"):
+            datetime.fromisoformat(str(value["last_updated"]).replace("Z", "+00:00"))
+            return value
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        pass
+    match = re.search(r"(20\d{2}-\d{2}-\d{2})", Path(archive).name)
+    return {"last_updated": match.group(1) if match else None, "version": None}
+
+
 def walk_forward(games: list[dict], player_k: float, team_k: float,
                  min_team_games: int = 8, min_player_games: float = 5.0) -> list[dict]:
     """Emit player and team Elo predictions strictly before each update."""
@@ -532,12 +547,13 @@ def walk_forward(games: list[dict], player_k: float, team_k: float,
 
 
 def build_model(title: str, player_k: float) -> dict:
-    """Build research state only. No live prediction path reads this model."""
+    """Build the final dual team/player state from a historical game stream."""
     games = load_games(title)
     if not games:
         return {}
     team_k = params.get(title)["k"]
-    ratings, played, team_ratings, team_played, lineups = {}, {}, {}, {}, {}
+    ratings, played, team_ratings, team_played, lineups, team_names = {}, {}, {}, {}, {}, {}
+    name_ids: dict[str, set[str]] = defaultdict(set)
     for game in games:
         (team1, lineup1), (team2, lineup2) = sorted(game["teams"].items())
         player1 = sum(ratings.get(p, DEFAULT_RATING) for p in lineup1) / len(lineup1)
@@ -559,9 +575,25 @@ def build_model(title: str, player_k: float) -> dict:
         team_played[team2] = team_played.get(team2, 0) + 1
         for team, lineup in game["teams"].items():
             lineups[team] = lineup
+        current_names = game.get("team_names") or {}
+        team_names.update(current_names)
+        for team, name in current_names.items():
+            if name:
+                name_ids[name].add(team)
     audit = audit_games(games)
+    source = valorant_source_metadata() if title == "valorant" else {}
+    team_lookup = {name: next(iter(team_ids)) for name, team_ids in name_ids.items()
+                   if len(team_ids) == 1}
+    latest_date = str(source.get("last_updated") or "")[:10] or audit["latest_date"]
     return {"title": title, "ratings": ratings, "played": played,
             "team_lineups": lineups, "team_elo": team_ratings, "team_games": team_played,
-            "latest_date": audit["latest_date"],
+            "team_names": team_names, "team_lookup": team_lookup,
+            "latest_date": latest_date, "source_updated_at": source.get("last_updated"),
+            "source_version": source.get("version"),
             "latest_sequence": audit["latest_sequence"], "player_k": player_k,
-            "team_k": team_k, "audit": audit, "eligible_for_live": False}
+            "team_k": team_k, "audit": audit}
+
+
+def build_valorant_live_model(player_k: float = 32.0) -> dict:
+    """LoL-style live sidecar using VLR IDs and the latest archive lineups."""
+    return build_model("valorant", player_k)

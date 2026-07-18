@@ -1,0 +1,27 @@
+{
+  "sport": "valorant",
+  "features": [
+    "elo_exp",
+    "elo_gap",
+    "rating_a",
+    "rating_b",
+    "games_a",
+    "games_b",
+    "p_exp",
+    "p_gap",
+    "p_min_gap",
+    "p_spread_diff",
+    "p_experience_diff"
+  ],
+  "calibration": {
+    "a": 1.0,
+    "b": 0.0
+  },
+  "order": "alpha",
+  "best_iteration": 22,
+  "beats_elo": true,
+  "beat_margin": 0.002,
+  "elo_brier": 0.2464,
+  "xgb_brier": 0.2404,
+  "trained_at": "2026-07-18T03:14:41.052189+00:00"
+}

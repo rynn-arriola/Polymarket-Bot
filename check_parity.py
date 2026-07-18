@@ -35,7 +35,8 @@ EXPECTED_EXTRA = {"config.py", "credentials.py"}
 # GENERATED DATA — the server rebuilds these every 6h and its copies are
 # SUPPOSED to be fresher than the local ones. Never scp them; never compare
 # them. (model_params.json is NOT here: it's tuned input, deployed like code.)
-GENERATED = {"elo_ratings.json", "elo_freshness.json", "lol_player_model.json"}
+GENERATED = {"elo_ratings.json", "elo_freshness.json", "lol_player_model.json",
+             "valorant_player_model.json"}
 
 
 def _run(cmd: list[str]) -> str:

@@ -36,7 +36,8 @@ a DigitalOcean droplet. Every change you make can lose money.
    ```
    server  --->  local     ALWAYS   (python pull_server_state.py, daily)
    local   --->  server    NEVER    (positions.db, elo_ratings.json,
-                                     elo_freshness.json, lol_player_model.json)
+                                     elo_freshness.json, lol_player_model.json,
+                                     valorant_player_model.json)
    ```
 
    **NEVER copy any `positions.db` TO the server.** The server's copy is the
@@ -193,7 +194,7 @@ It compares every tracked runtime file against the server and reports:
 
 Line endings are normalized (the repo is CRLF on Windows, the server is LF), so
 it only reports *real* content drift. Generated data (`elo_ratings.json`,
-`elo_freshness.json`, `lol_player_model.json`) is deliberately **not** compared
+`elo_freshness.json`, `lol_player_model.json`, `valorant_player_model.json`) is deliberately **not** compared
 — the server rebuilds those every 6h and its copies are *supposed* to be
 fresher. `credentials.example.py` is expected to be absent on the server.
 
@@ -436,7 +437,7 @@ pattern applied to the sports where roster churn hurts most:
 | LoL | Oracle's Elixir CSVs | **have it** — powers the live blend |
 | Dota 2 | OpenDota collector + published pro-match Parquet | **research bootstrap built 2026-07-18 on `codex/dota-cs2-player-bootstrap`, not live.** `darianogina/dota-2-matches-pro-leagues` contains 193,773 raw maps / 191,202 usable merged games with stable player ids. Real archive audit found it ends **2024-10-15**, leaving a 638-day gap to the current OpenDota collector. Server audit before acceleration: 1,006/39,917 lineups captured (2.5%, 38,911 pending). The 2026-07-18 00:08 UTC refresh proved the old `added=0` path could walk into HTTP 429 before lineup capture. The completed id walk now stops after two known pages and the lineup batch rises 300→450 per 6h run, reducing the estimate from ~32 to ~22 days while remaining under 2,000 calls/day. Chronological same-source test: player Elo 0.2356 vs team Elo 0.2458 over 23,898 maps, but that universe is not comparable to production PandaScore's 0.2146 series-level Brier. Bulk/OpenDota overlap is keyed by the shared match id: bulk wins the merge, and the collector skips per-match API calls for ids already in the Parquet. Useful cold start; **does not clear the live gate**. |
 | CS2 | bo3.gg forward collector + parsed-demo metadata | **research bootstrap built 2026-07-18 on `codex/dota-cs2-player-bootstrap`, not live.** The initially considered Kaggle HLTV dataset was **rejected**: a May 2024 Spirit row contains later roster members, proving its player columns leak current rosters backward. Replacement `blanchon/cs2_dataset_demo` is replay-grounded and yields 1,000 exact maps (2026-03-23–04-20). The bo3 nickname migration was driven against the real endpoint locally: 472 stored rows / 4,297 player entries, all canonical nickname keys and zero legacy ids. Combined audit: 1,472 maps, a 59-day source gap, and **83 eligible test predictions** — still below the 100-game minimum, so there is no model verdict and no live activation. Its metadata is CC-BY, but the publisher says original tournament terms may still apply; provenance/usage review is another required pre-live gate. |
-| Valorant | Kaggle VCT dataset (found 2026-07-18) | **viable, not yet built.** `ryanluong1/valorant-champion-tour-2021-2023-data` (title says 2021–2026): per-map 5-player lineups + rich stats, MIT, ~monthly updates (last 2026-06-26), anonymously downloadable — the Oracle's-Elixir pattern, zero scraping by us. Verified 2026-07-18 on the real archive. Caveats for the eventual build: **no dates** (order by Match ID — vlr assigns them ~chronologically), ~7% of scores rows have team-name/Match-Name mismatches (**join on Team IDs**, as the author warns), China-hosted matches missing stats, and updates lag up to ~a month (needs an OE-style staleness gate). Build waits until the Dota/CS2 collectors prove the player-model pattern. The 07-16 "no free per-match source" conclusion was true for APIs but missed published datasets. |
+| Valorant | Kaggle VCT dataset | **LoL-pattern build complete 2026-07-18 on `codex/valorant-live-parity`; not deployed or active.** The MIT archive yielded 26,470 exact-ID maps through VLR Match ID 684619, 14,963 players, and 3,811 team states. A five-seed chronological research gate beat both baselines on every seed; the canonical shared extractor produced test Brier **0.2404 vs 0.2464 team Elo**. Training and live inference now share the same player feature builder. Refresh checks Kaggle version metadata, then the server builds `valorant_player_model.json` with stable VLR player/team IDs, latest lineups, and source freshness; missing/stale/malformed/unresolved state falls back to PandaScore team Elo. Real local inference was driven on NRG vs Gentle Mates (0.6483 / 0.3517). Current 45-day name coverage is **90% for top-tier `s` events**, but only 51.4% across all tiers because the archive omits many academy/lower-tier teams; those markets remain on Elo. Source caveats remain: no match dates (monotonic Match ID chronology), rejected malformed joins, missing China stats, and monthly update lag. |
 
 ### Name matching — the highest-maintenance part of the system
 
