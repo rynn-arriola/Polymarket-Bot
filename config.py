@@ -399,6 +399,15 @@ RESCHEDULE_EXIT_AFTER_HOURS = RESCHEDULE_MARK_AFTER_HOURS
 # this converges far faster than settled P&L. The bot re-snapshots each cycle
 # inside this window, so the last value before start is the true closing line.
 CLOSING_CAPTURE_MINUTES = 5
+# If the pre-start window was missed entirely (bot down, Cloudflare ban
+# cooldown — those escalate up to 40 min), a single post-start price is still
+# captured up to this many minutes after start, so the trade isn't silently
+# absent from CLV forever. A late capture is in-play-tainted (the price has
+# started drifting toward 0/1), which is why this is a fallback and the
+# pre-start snapshot always wins when it exists. Must outlast the longest ban
+# cooldown (API_BAN_COOLDOWN_MAX_MIN = 40) or a ban spanning tip-off loses
+# the sample.
+CLOSING_FALLBACK_MINUTES = 60
 
 # --- Self-refresh (24/7 server operation) ---
 # The running bot rebuilds all ratings this often (hours) by spawning

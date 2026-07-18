@@ -52,6 +52,40 @@ def money(value: float) -> str:
 # Stats
 # ------------------------------------------------------------------
 
+# CLV is only meaningful on FILLED trades. A cancelled row is usually an order
+# that didn't fill because the price ran away from it — counting its captured
+# close reports "the market moved toward our bet" on money that was never at
+# risk, a selection bias that flatters CLV. Pending rows are excluded until
+# they either fill (open) or die (cancelled); their captured close is kept and
+# counts the moment they fill.
+CLV_FILLED = "status IN ('open','won','lost','push')"
+
+
+def clv_capture_coverage(table: str = "positions") -> tuple[int, int]:
+    """(captured, eligible) closing-line coverage — the "are we measuring
+    everything?" check. Eligible = rows whose game started long enough ago
+    that every capture chance (pre-start window + post-start fallback) is
+    exhausted; captured = those that actually hold a close. A shortfall means
+    trades are silently absent from every CLV figure (the 2026-07-13/14
+    downtime lost 10 this way, invisibly) — audit_reporting lists the rows.
+    For positions only filled trades count (see CLV_FILLED); for
+    shadow_signals every recorded signal counts."""
+    grace = getattr(config, "CLOSING_FALLBACK_MINUTES", 60) + 10
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=grace)).isoformat()
+    status_filter = CLV_FILLED if table == "positions" else "1=1"
+    try:
+        captured, eligible = db(
+            f"""SELECT SUM(closing_price IS NOT NULL), COUNT(*)
+                FROM {table}
+                WHERE live = ? AND {status_filter}
+                  AND game_start IS NOT NULL AND datetime(game_start) <= datetime(?)""",
+            (1 if config.LIVE else 0, cutoff), fetch=True,
+        )[0]
+    except Exception:
+        return 0, 0
+    return captured or 0, eligible or 0
+
+
 def stats_for_period(kind: str) -> dict:
     if kind in ("today", "week", "month"):
         start, end = period_bounds_utc(kind)
@@ -94,7 +128,8 @@ def stats_for_period(kind: str) -> dict:
                    AVG(CASE WHEN closing_price > market_price THEN 1.0 ELSE 0.0 END),
                    COUNT(*)
             FROM positions
-            WHERE {created_filter} AND closing_price IS NOT NULL AND market_price IS NOT NULL""",
+            WHERE {created_filter} AND {CLV_FILLED}
+              AND closing_price IS NOT NULL AND market_price IS NOT NULL""",
         args, fetch=True,
     )[0]
     # Yield = realized P&L as a share of money actually staked (settled bets) —
@@ -185,9 +220,9 @@ def stats_by_divergence() -> list[dict]:
         # settled) — the leading edge signal: does the market move toward our
         # bigger-divergence bets? Available at game start, before settlement.
         avg_clv, clv_n = db(
-            """SELECT AVG(closing_price - market_price), COUNT(*)
+            f"""SELECT AVG(closing_price - market_price), COUNT(*)
                FROM positions
-               WHERE divergence >= ? AND divergence < ?
+               WHERE divergence >= ? AND divergence < ? AND {CLV_FILLED}
                  AND closing_price IS NOT NULL AND market_price IS NOT NULL AND live = ?""",
             (lo, hi, live), fetch=True,
         )[0]
@@ -1386,12 +1421,20 @@ def post_discord_clv(reason: str = "CLV update") -> bool:
                    + ("market moving TOWARD our bets (edge looks real)" if overall_clv > 0
                       else "market moving AGAINST our bets" if overall_clv < 0
                       else "flat"))
+    # Capture coverage: with every capture chance exhausted, is any filled
+    # trade missing from the CLV sample? A shortfall here means the numbers
+    # above are computed on an incomplete (and possibly biased) subset.
+    cap, elig = clv_capture_coverage("positions")
+    missed = elig - cap
+    coverage_line = (f"Capture coverage: {cap}/{elig} filled trades"
+                     + (f" — ⚠️ {missed} missing a close (run audit_reporting.py)"
+                        if missed else " ✅"))
     payload = {
         "username": BOT_NAME,
         "embeds": [{
             "title": f"{pnl_emoji(overall_clv) if overall_clv is not None else '📉'} Polybot CLV Report",
             "description": f"**{verdict}**\n{reason} — CLV = how far the market moved toward our "
-                           "bets by tip-off. Consistently positive = real edge.",
+                           f"bets by tip-off. Consistently positive = real edge.\n{coverage_line}",
             "color": sidebar,
             "fields": fields,
             "footer": {"text": f"{BOT_NAME} | {mode_badge}"},
@@ -1495,12 +1538,19 @@ def post_discord_paper_clv(reason: str = "Paper CLV update") -> bool:
                    + ("market moving TOWARD the signals (model looks real)" if overall_clv > 0
                       else "market moving AGAINST the signals" if overall_clv < 0
                       else "flat"))
+    # Same coverage check as the live report, over the whole paper ledger —
+    # if signals are missing closes, the model verdict is drawn on a subset.
+    cap, elig = clv_capture_coverage("shadow_signals")
+    missed = elig - cap
+    coverage_line = (f"Capture coverage: {cap}/{elig} signals"
+                     + (f" — ⚠️ {missed} missing a close (run audit_reporting.py)"
+                        if missed else " ✅"))
     payload = {
         "username": BOT_NAME,
         "embeds": [{
             "title": "🧪 Paper CLV Report — tracking only",
             "description": f"**{verdict}**\n{reason} — every valid signal incl. declined ones; "
-                           "estimated results, excluded from real P&L.",
+                           f"estimated results, excluded from real P&L.\n{coverage_line}",
             "color": sidebar,
             "fields": fields,
             "footer": {"text": f"{BOT_NAME} | {mode_badge} | 🧪 paper ledger — not real money"},
