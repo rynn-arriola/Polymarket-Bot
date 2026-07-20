@@ -30,7 +30,9 @@ SECRET_KEY = _secret("SECRET_KEY", "PASTE_YOUR_SECRET_KEY")
 # Run dry for a good stretch first — this strategy has never traded before,
 # unlike the existing band-filter bot. Judge nothing before ~100 settled
 # positions AND a `python backtest.py` calibration table that looks sane.
-LIVE = True
+# 2026-07-20: paper mode by operator call — no real money in the account for
+# now. The live order path stays intact; flip back to True to resume trading.
+LIVE = False
 
 # --- Strategy: divergence entries ---
 # Our own Elo-derived win probability vs. Polymarket's current mid price

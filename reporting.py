@@ -1056,26 +1056,6 @@ def discord_field(label: str, stats: dict, inline: bool) -> dict:
     }
 
 
-def discord_manual_field(stats: dict, inline: bool = False) -> dict | None:
-    if not stats.get("entries"):
-        return None
-    y = stats.get("yield")
-    yield_str = f"  Yield:    {y:+.1%}\n" if y is not None else ""
-    return {
-        "name": f"{pnl_emoji(stats['pnl'])} Manual Trades",
-        "value": (
-            "```ansi\n"
-            f"P&L:      {pnl_ansi(stats['pnl'])}\n"
-            f"Record:   {stats['won']}W / {stats['lost']}L / {stats['push']}P\n"
-            f"Cashout:  {stats['cashed_out']} | Cancelled: {stats['cancelled']}\n"
-            f"Entries:  {stats['entries']} (open {stats['open']})\n"
-            f"{yield_str}"
-            "```"
-        ),
-        "inline": inline,
-    }
-
-
 def discord_paper_field(label: str, stats: dict, inline: bool) -> dict:
     """One period of paper-signal stats, visually matching discord_field."""
     return {
@@ -1171,9 +1151,9 @@ def post_discord_summary(reason: str = "Status update") -> bool:
         discord_field("This Month", snapshot["month"], True),
         discord_field("Overall", snapshot["overall"], False),
     ]
-    manual_field = discord_manual_field(snapshot.get("manual_overall", {}), False)
-    if manual_field:
-        fields.append(manual_field)
+    # Manual trades intentionally NOT here (operator call 2026-07-20) — they
+    # stay off the summary webhook; the CLV report and settlement cards still
+    # carry them.
     # Paper signals intentionally NOT here — they have their own embed
     # (post_discord_paper_summary) on the same cadence, so estimated
     # numbers never sit inside the real-money summary.
@@ -1238,19 +1218,8 @@ def post_discord_daily_digest() -> bool:
     # Paper signals are NOT in the digest — they live on their own embed
     # (post_discord_paper_summary), keeping this digest real-money only.
 
-    manual = manual_stats_for_period("overall")
-    if manual.get("entries"):
-        my = f"  yield {manual['yield']:+.1%}" if manual.get("yield") is not None else ""
-        m_code = "32" if manual["pnl"] > 0 else "31" if manual["pnl"] < 0 else "2;37"
-        fields.append({
-            "name": "Manual Trades (separate ledger)",
-            "value": ("```ansi\n"
-                      f"\x1b[{m_code}mP&L     {manual['pnl']:+.2f}{my}\x1b[0m\n"
-                      f"Record  {manual['won']}W-{manual['lost']}L-{manual['push']}P   "
-                      f"cashout {manual['cashed_out']}   cancelled {manual['cancelled']}\n"
-                      f"Entries {manual['entries']} (open {manual['open']})\n```"),
-            "inline": False,
-        })
+    # Manual trades intentionally NOT here (operator call 2026-07-20) — kept
+    # off everything that posts to the summary webhook.
     # Per-sport win rate is NOT here — it's on the CLV tracker webhook now.
 
     div_rows = stats_by_divergence()
